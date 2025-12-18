@@ -9,7 +9,7 @@ import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
 import shopRoutes from './routes/shops.js';
 import serviceRoutes from './routes/services.js';
-import appointmentRoutes from './routes/appointments.js';
+import appointmentRoutes from './routes/appointmentRoutes.js';
 import productRoutes from './routes/products.js';
 import uploadRoutes from './routes/upload.js';
 import chatRoutes from './routes/chatRoutes.js';

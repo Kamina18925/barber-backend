@@ -3,6 +3,47 @@ import { getOrCreateClientBarberConversation } from './chatController.js';
 
 const normalizeRole = (role) => String(role || '').toLowerCase();
 
+const DEFAULT_TIMEZONE_OFFSET = process.env.APP_TZ_OFFSET || '-04:00';
+
+const normalizeAppointmentDateInput = (input) => {
+  if (input instanceof Date) {
+    const ms = input.getTime();
+    return Number.isNaN(ms) ? null : input.toISOString();
+  }
+
+  if (typeof input === 'number') {
+    const d = new Date(input);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+
+  if (typeof input !== 'string') return null;
+
+  const s = input.trim();
+  if (!s) return null;
+
+  const hasExplicitOffset = /Z$|[+-]\d{2}:\d{2}$/.test(s);
+  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(s);
+  const isNaiveIsoDateTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(s);
+
+  if (hasExplicitOffset) {
+    const d = new Date(s);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+
+  if (isDateOnly) {
+    const d = new Date(`${s}T00:00:00${DEFAULT_TIMEZONE_OFFSET}`);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+
+  if (isNaiveIsoDateTime) {
+    const d = new Date(`${s}${DEFAULT_TIMEZONE_OFFSET}`);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+};
+
 const canUserDeleteSingleAppointment = ({ requesterId, requesterRole }) => {
   if (requesterId == null) return false;
   const role = normalizeRole(requesterRole);
@@ -386,8 +427,9 @@ export const createAppointment = async (req, res) => {
     const finalServiceId = serviceId !== undefined ? serviceId : service_id;
     const finalStatus = (status || estado || 'confirmed').toLowerCase();
     const finalNotes = notes || notas || null;
+    const normalizedDate = normalizeAppointmentDateInput(finalDate);
 
-    if (!finalDate || !finalClientId || !finalBarberId || !finalShopId || !finalServiceId) {
+    if (!finalDate || !normalizedDate || !finalClientId || !finalBarberId || !finalShopId || !finalServiceId) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Datos incompletos para crear la cita' });
     }
@@ -398,7 +440,7 @@ export const createAppointment = async (req, res) => {
        WHERE barber_id = $1
          AND date = $2
          AND status != 'cancelled'`,
-      [finalBarberId, finalDate]
+      [finalBarberId, normalizedDate]
     );
 
     if (overlapCheck.rows.length > 0) {
@@ -422,7 +464,7 @@ export const createAppointment = async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6, $7)
       RETURNING id, date, status, notes, client_id, barber_id, shop_id, service_id`,
       [
-        finalDate,
+        normalizedDate,
         finalStatus,
         finalNotes,
         finalClientId,
@@ -482,11 +524,13 @@ export const proposeAdvanceAppointment = async (req, res) => {
     const appointment = apptRes.rows[0];
 
     // Crear notificación para el cliente
-    const newTimeDate = new Date(newTime);
+    const normalizedNewTime = normalizeAppointmentDateInput(newTime);
+    const newTimeDate = new Date(normalizedNewTime || newTime);
     const timeLabel = newTimeDate.toLocaleTimeString('es-DO', {
       hour: '2-digit',
       minute: '2-digit',
       hour12: true,
+      timeZone: 'America/Santo_Domingo',
     });
 
     const notifRes = await client.query(
@@ -589,8 +633,11 @@ export const createBarberDayOff = async (req, res) => {
       return res.status(400).json({ message: 'Faltan datos para marcar el día libre (date, barberId, shopId)' });
     }
 
-    // Normalizar fecha: si viene solo YYYY-MM-DD, agregar T00:00:00
-    const finalDate = date.includes('T') ? date : `${date}T00:00:00`;
+    const normalizedDate = normalizeAppointmentDateInput(date);
+    if (!normalizedDate) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Fecha inválida para marcar el día libre' });
+    }
 
     const result = await client.query(
       `INSERT INTO appointments (
@@ -604,7 +651,7 @@ export const createBarberDayOff = async (req, res) => {
       )
       VALUES ($1, 'day_off', $2, NULL, $3, $4, NULL)
       RETURNING id, date, status, notes, client_id, barber_id, shop_id, service_id`,
-      [finalDate, finalNotes, finalBarberId, finalShopId]
+      [normalizedDate, finalNotes, finalBarberId, finalShopId]
     );
 
     await client.query('COMMIT');
