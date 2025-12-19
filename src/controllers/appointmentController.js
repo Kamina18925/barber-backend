@@ -119,6 +119,78 @@ export const getAllAppointments = async (req, res) => {
   }
 };
 
+export const createBarberLeaveEarly = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const {
+      startTime,
+      start_time,
+      date,
+      time,
+      barberId,
+      barber_id,
+      shopId,
+      shop_id,
+      notes,
+    } = req.body || {};
+
+    const finalBarberId = barberId !== undefined ? barberId : barber_id;
+    const finalShopId = shopId !== undefined ? shopId : shop_id;
+
+    let rawDateTime = startTime !== undefined ? startTime : start_time;
+    if (!rawDateTime && date && time) {
+      rawDateTime = `${String(date).trim()}T${String(time).trim()}:00`;
+    }
+
+    if (!rawDateTime || !finalBarberId || !finalShopId) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Faltan datos para marcar salida temprana (startTime/date+time, barberId, shopId)' });
+    }
+
+    const normalizedDateTime = normalizeAppointmentDateInput(rawDateTime);
+    if (!normalizedDateTime) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Fecha/hora inválida para salida temprana' });
+    }
+
+    await client.query(
+      `UPDATE appointments
+       SET status = 'cancelled', updated_at = NOW()
+       WHERE barber_id = $1
+         AND shop_id = $2
+         AND status = 'leave_early'
+         AND DATE(date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Santo_Domingo') = DATE($3 AT TIME ZONE 'UTC' AT TIME ZONE 'America/Santo_Domingo')`,
+      [finalBarberId, finalShopId, normalizedDateTime]
+    );
+
+    const result = await client.query(
+      `INSERT INTO appointments (
+        date,
+        status,
+        notes,
+        client_id,
+        barber_id,
+        shop_id,
+        service_id
+      )
+      VALUES ($1, 'leave_early', $2, NULL, $3, $4, NULL)
+      RETURNING id, date, status, notes, client_id, barber_id, shop_id, service_id`,
+      [normalizedDateTime, notes || null, finalBarberId, finalShopId]
+    );
+
+    await client.query('COMMIT');
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error al marcar salida temprana del barbero:', error);
+    return res.status(500).json({ message: 'Error del servidor al marcar salida temprana del barbero' });
+  } finally {
+    client.release();
+  }
+};
+
 // Eliminación permanente de historial de citas de un barbero (solo días anteriores)
 // Modos:
 // - cancelled: status LIKE 'cancelled%'
@@ -213,7 +285,7 @@ export const deleteBarberAppointmentsHistory = async (req, res) => {
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error al eliminar historial de citas del barbero:', error);
-    return res.status(500).json({ message: 'Error del servidor al eliminar historial de citas del barbero' });
+    return res.status(500).json({ message: 'Error del servidor al eliminar historial de citas' });
   } finally {
     client.release();
   }
@@ -398,7 +470,7 @@ export const createAppointment = async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
+    
     const {
       // Fecha/hora: el frontend envía startTime (ISO) o date
       date,
@@ -419,7 +491,7 @@ export const createAppointment = async (req, res) => {
       notes,
       notas
     } = req.body;
-
+    
     const finalDate = date || startTime || start_time;
     const finalClientId = clientId !== undefined ? clientId : client_id;
     const finalBarberId = barberId !== undefined ? barberId : barber_id;
@@ -428,12 +500,12 @@ export const createAppointment = async (req, res) => {
     const finalStatus = (status || estado || 'confirmed').toLowerCase();
     const finalNotes = notes || notas || null;
     const normalizedDate = normalizeAppointmentDateInput(finalDate);
-
+    
     if (!finalDate || !normalizedDate || !finalClientId || !finalBarberId || !finalShopId || !finalServiceId) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Datos incompletos para crear la cita' });
     }
-
+    
     // Verificar que el barbero no tenga ya una cita en ese mismo instante (slot ocupado)
     const overlapCheck = await client.query(
       `SELECT id, status FROM appointments
@@ -442,7 +514,7 @@ export const createAppointment = async (req, res) => {
          AND status != 'cancelled'`,
       [finalBarberId, normalizedDate]
     );
-
+    
     if (overlapCheck.rows.length > 0) {
       await client.query('ROLLBACK');
       return res.status(409).json({
@@ -450,6 +522,109 @@ export const createAppointment = async (req, res) => {
       });
     }
 
+    const leaveEarlyCheck = await client.query(
+      `SELECT date
+       FROM appointments
+       WHERE barber_id = $1
+         AND shop_id = $2
+         AND status = 'leave_early'
+         AND DATE(date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Santo_Domingo') = DATE($3 AT TIME ZONE 'UTC' AT TIME ZONE 'America/Santo_Domingo')
+       ORDER BY date DESC
+       LIMIT 1`,
+      [finalBarberId, finalShopId, normalizedDate]
+    );
+
+    if (leaveEarlyCheck.rows.length > 0) {
+      const cutoff = leaveEarlyCheck.rows[0]?.date ? new Date(leaveEarlyCheck.rows[0].date).getTime() : NaN;
+      const desired = new Date(normalizedDate).getTime();
+      if (!Number.isNaN(cutoff) && !Number.isNaN(desired) && desired >= cutoff) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          message: 'El barbero se retira temprano hoy. Por favor elige otra hora.',
+        });
+      }
+    }
+
+    try {
+      const svcRes = await client.query('SELECT duration FROM services WHERE id = $1', [finalServiceId]);
+      const durationMinutes = Math.max(0, Number(svcRes.rows[0]?.duration) || 0);
+
+      const startMs = new Date(normalizedDate).getTime();
+      const startDateObj = new Date(startMs);
+
+      const startMin = startDateObj.getHours() * 60 + startDateObj.getMinutes();
+      const endMin = startMin + durationMinutes;
+
+      const dayKeyByIndex = ['D', 'L', 'M', 'X', 'J', 'V', 'S'];
+      const dayKey = dayKeyByIndex[startDateObj.getDay()] || null;
+      const prevDayKey = dayKeyByIndex[(startDateObj.getDay() + 6) % 7] || null;
+
+      if (dayKey && prevDayKey) {
+        const breaksRes = await client.query(
+          `SELECT day, start_time, end_time
+           FROM barber_breaks
+           WHERE barber_id = $1
+             AND enabled = true
+             AND day IN ($2, $3)`,
+          [finalBarberId, dayKey, prevDayKey]
+        );
+
+        const toMinutes = (t) => {
+          if (!t) return null;
+          const s = String(t);
+          const parts = s.split(':');
+          const hh = Number(parts[0]);
+          const mm = Number(parts[1] || 0);
+          if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+          return (hh * 60) + mm;
+        };
+
+        const intervals = [];
+        for (const row of (breaksRes.rows || [])) {
+          const bStart = toMinutes(row.start_time);
+          const bEnd = toMinutes(row.end_time);
+          if (bStart == null || bEnd == null) continue;
+
+          const crosses = bStart > bEnd;
+          if (String(row.day) === String(dayKey)) {
+            if (!crosses) {
+              intervals.push([bStart, bEnd]);
+            } else {
+              intervals.push([bStart, 1440]);
+            }
+          }
+          if (crosses && String(row.day) === String(prevDayKey)) {
+            intervals.push([0, bEnd]);
+          }
+        }
+
+        const overlaps = (aStart, aEnd, bStart, bEnd) => aStart < bEnd && aEnd > bStart;
+
+        const apptIntervals = [];
+        if (endMin <= 1440) {
+          apptIntervals.push([startMin, endMin]);
+        } else {
+          apptIntervals.push([startMin, 1440]);
+          apptIntervals.push([0, endMin - 1440]);
+        }
+
+        const hasConflict = intervals.some(([bStart, bEnd]) =>
+          apptIntervals.some(([aStart, aEnd]) => overlaps(aStart, aEnd, bStart, bEnd))
+        );
+
+        if (hasConflict) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            message: 'El barbero está en descanso en ese horario. Por favor elige otra hora.',
+          });
+        }
+      }
+    } catch (e) {
+      if (!(e && e.code === '42P01')) {
+        throw e;
+      }
+    }
+    
     // Insertar la cita en la tabla appointments (esquema actual)
     const result = await client.query(
       `INSERT INTO appointments (
@@ -473,21 +648,21 @@ export const createAppointment = async (req, res) => {
         finalServiceId
       ]
     );
-
+    
     await client.query('COMMIT');
-
+    
     res.status(201).json(result.rows[0]);
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error al crear cita:', error);
-
+    
     // Si existe una constraint única en BD (barber_id, date), capturar el error de violación única
     if (error && error.code === '23505') {
       return res.status(409).json({
         message: 'El barbero ya tiene una cita en ese horario. Por favor elige otra hora.',
       });
     }
-
+    
     res.status(500).json({ message: 'Error del servidor al crear cita' });
   } finally {
     client.release();
@@ -499,15 +674,15 @@ export const proposeAdvanceAppointment = async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
+    
     const { id } = req.params;
     const { newTime } = req.body || {};
-
+    
     if (!newTime) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Falta newTime en el cuerpo de la petición' });
     }
-
+    
     // Verificar que la cita existe y obtener datos básicos
     const apptRes = await client.query(
       `SELECT id, date, client_id, barber_id
@@ -515,14 +690,14 @@ export const proposeAdvanceAppointment = async (req, res) => {
        WHERE id = $1`,
       [id]
     );
-
+    
     if (apptRes.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Cita no encontrada' });
     }
-
+    
     const appointment = apptRes.rows[0];
-
+    
     // Crear notificación para el cliente
     const normalizedNewTime = normalizeAppointmentDateInput(newTime);
     const newTimeDate = new Date(normalizedNewTime || newTime);
@@ -532,7 +707,7 @@ export const proposeAdvanceAppointment = async (req, res) => {
       hour12: true,
       timeZone: 'America/Santo_Domingo',
     });
-
+    
     const notifRes = await client.query(
       `INSERT INTO notifications (
          user_id,
@@ -552,11 +727,11 @@ export const proposeAdvanceAppointment = async (req, res) => {
         JSON.stringify({ appointmentId: appointment.id, newTime }),
       ]
     );
-
+    
     const notification = notifRes.rows[0];
-
+    
     await client.query('COMMIT');
-
+    
     // Crear/obtener conversación y mensaje de sistema en una transacción aparte
     let conversationId;
     try {
@@ -565,7 +740,7 @@ export const proposeAdvanceAppointment = async (req, res) => {
       console.error('Error al obtener/crear conversación para adelanto:', convError);
       // No revertimos la notificación ya creada; solo logueamos
     }
-
+    
     if (conversationId) {
       try {
         await pool.query(
@@ -592,7 +767,7 @@ export const proposeAdvanceAppointment = async (req, res) => {
         console.error('Error al crear mensaje automático de adelanto:', msgError);
       }
     }
-
+    
     return res.status(201).json({
       message: 'Propuesta de adelanto creada',
       notification,
@@ -612,7 +787,7 @@ export const createBarberDayOff = async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
+    
     const {
       date,          // ISO o YYYY-MM-DD
       barberId,
@@ -623,22 +798,24 @@ export const createBarberDayOff = async (req, res) => {
       razon,
       reason,
     } = req.body || {};
-
+    
     const finalBarberId = barberId !== undefined ? barberId : barber_id;
     const finalShopId = shopId !== undefined ? shopId : shop_id;
     const finalNotes = notes || razon || reason || null;
-
+    
     if (!date || !finalBarberId || !finalShopId) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Faltan datos para marcar el día libre (date, barberId, shopId)' });
     }
-
+    
+    // Normalizar fecha: si viene solo YYYY-MM-DD, agregar T00:00:00
     const normalizedDate = normalizeAppointmentDateInput(date);
+    
     if (!normalizedDate) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Fecha inválida para marcar el día libre' });
     }
-
+    
     const result = await client.query(
       `INSERT INTO appointments (
         date,
@@ -653,9 +830,9 @@ export const createBarberDayOff = async (req, res) => {
       RETURNING id, date, status, notes, client_id, barber_id, shop_id, service_id`,
       [normalizedDate, finalNotes, finalBarberId, finalShopId]
     );
-
+    
     await client.query('COMMIT');
-
+    
     return res.status(201).json(result.rows[0]);
   } catch (error) {
     await client.query('ROLLBACK');
@@ -792,16 +969,15 @@ export const cancelAppointment = async (req, res) => {
     const startMs = appt.date ? new Date(appt.date).getTime() : NaN;
     const isPast = Number.isNaN(startMs) ? false : startMs < Date.now();
 
-    // No permitir cancelar citas en el pasado (aunque sigan en confirmed)
-    if (isPast) {
+    const canCancel = status === 'confirmed' || status === 'day_off' || status === 'leave_early';
+    if (!canCancel) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'No puedes cancelar una cita pasada.' });
+      return res.status(400).json({ message: 'No se puede cancelar esta cita con el estado actual.' });
     }
 
-    // Solo permitir cancelar si está confirmada
-    if (status !== 'confirmed') {
+    if (status === 'confirmed' && isPast) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'Solo puedes cancelar citas confirmadas.' });
+      return res.status(400).json({ message: 'No puedes cancelar una cita pasada.' });
     }
 
     // Actualizar estado a cancelada

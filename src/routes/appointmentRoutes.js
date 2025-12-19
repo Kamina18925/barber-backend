@@ -13,6 +13,7 @@ import {
   deleteAppointmentById,
   deleteAppointmentsByClientAndStatus,
   createBarberDayOff,
+  createBarberLeaveEarly,
   proposeAdvanceAppointment,
   deleteBarberAppointmentsHistory,
 } from '../controllers/appointmentController.js';
@@ -34,6 +35,9 @@ router.post('/:id/propose-advance', proposeAdvanceAppointment);
 
 // Día libre de barbero
 router.post('/day-off', createBarberDayOff);
+
+// Salida temprana de barbero
+router.post('/leave-early', createBarberLeaveEarly);
 
 // Eliminar historial de citas de un cliente
 // Coincide con frontend: appointmentApi.deleteHistory -> /appointments/history/:clientId
