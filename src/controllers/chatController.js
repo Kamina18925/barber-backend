@@ -183,11 +183,13 @@ export const getUserConversations = async (req, res) => {
            SELECT MAX(m.created_at)
            FROM messages m
            WHERE m.conversation_id = conv.id
+             AND NOT (m.is_system = TRUE AND m.related_action = 'RETENTION_POLICY')
          ) AS last_message_at,
          (
            SELECT m2.text
            FROM messages m2
            WHERE m2.conversation_id = conv.id
+             AND NOT (m2.is_system = TRUE AND m2.related_action = 'RETENTION_POLICY')
            ORDER BY m2.created_at DESC
            LIMIT 1
          ) AS last_message_text,
@@ -197,6 +199,7 @@ export const getUserConversations = async (req, res) => {
            WHERE m3.conversation_id = conv.id
              AND m3.receiver_id = $1
              AND m3.read_at IS NULL
+             AND NOT (m3.is_system = TRUE AND m3.related_action = 'RETENTION_POLICY')
          ) AS unread_count
        FROM conversations conv
        LEFT JOIN users u
@@ -305,11 +308,13 @@ export const getOwnerConversations = async (req, res) => {
            SELECT MAX(m.created_at)
            FROM messages m
            WHERE m.conversation_id = conv.id
+             AND NOT (m.is_system = TRUE AND m.related_action = 'RETENTION_POLICY')
          ) AS last_message_at,
          (
            SELECT m2.text
            FROM messages m2
            WHERE m2.conversation_id = conv.id
+             AND NOT (m2.is_system = TRUE AND m2.related_action = 'RETENTION_POLICY')
            ORDER BY m2.created_at DESC
            LIMIT 1
          ) AS last_message_text,
@@ -319,6 +324,7 @@ export const getOwnerConversations = async (req, res) => {
            WHERE m3.conversation_id = conv.id
              AND m3.receiver_id = conv.client_id
              AND m3.read_at IS NULL
+             AND NOT (m3.is_system = TRUE AND m3.related_action = 'RETENTION_POLICY')
          ) AS unread_for_client,
          (
            SELECT COUNT(*)
@@ -326,6 +332,7 @@ export const getOwnerConversations = async (req, res) => {
            WHERE m4.conversation_id = conv.id
              AND m4.receiver_id = conv.barber_id
              AND m4.read_at IS NULL
+             AND NOT (m4.is_system = TRUE AND m4.related_action = 'RETENTION_POLICY')
          ) AS unread_for_barber
        FROM conversations conv
        LEFT JOIN appointments a ON conv.appointment_id = a.id

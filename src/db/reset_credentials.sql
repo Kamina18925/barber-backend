@@ -34,14 +34,14 @@ INSERT INTO users (
 SELECT 
     md5(random()::text || clock_timestamp()::text)::uuid, 
     'Administrador', 
-    'admin@barberiaRD.com', 
+    'admin@stylex.app', 
     '809-123-4567', 
     '$2b$10$XtZZYFzLBSqzWh8HKUd4ZOVToaqYDvN8XjIK9BUZjmI.GQn7HFV3S', -- 'Admin123!'
     'admin',
     CURRENT_TIMESTAMP,
     CURRENT_TIMESTAMP
 WHERE NOT EXISTS (
-    SELECT 1 FROM users WHERE email = 'admin@barberiaRD.com'
+    SELECT 1 FROM users WHERE email = 'admin@stylex.app'
 );
 
 -- 3. Crear propietario de demostración si no existe
@@ -58,14 +58,14 @@ INSERT INTO users (
 SELECT 
     md5(random()::text || clock_timestamp()::text)::uuid,
     'Propietario Demo', 
-    'owner@barberiaRD.com', 
+    'owner@stylex.app', 
     '809-456-7890', 
     '$2b$10$XtZZYFzLBSqzWh8HKUd4ZOVToaqYDvN8XjIK9BUZjmI.GQn7HFV3S', -- 'Admin123!'
     'owner',
     CURRENT_TIMESTAMP,
     CURRENT_TIMESTAMP
 WHERE NOT EXISTS (
-    SELECT 1 FROM users WHERE email = 'owner@barberiaRD.com'
+    SELECT 1 FROM users WHERE email = 'owner@stylex.app'
 );
 
 -- 4. Crear barbero de demostración si no existe
@@ -82,14 +82,14 @@ INSERT INTO users (
 SELECT 
     md5(random()::text || clock_timestamp()::text)::uuid,
     'Barbero Demo', 
-    'barber@barberiaRD.com', 
+    'barber@stylex.app', 
     '809-234-5678', 
     '$2b$10$GqJTWG7tLGhSIVNnPLfBP.wvRgVQITZ1TfmXxJgUMFQ6AoNHwMyV2', -- 'Barber123!'
     'barber',
     CURRENT_TIMESTAMP,
     CURRENT_TIMESTAMP
 WHERE NOT EXISTS (
-    SELECT 1 FROM users WHERE email = 'barber@barberiaRD.com'
+    SELECT 1 FROM users WHERE email = 'barber@stylex.app'
 );
 
 -- 5. Crear cliente de demostración si no existe
@@ -106,14 +106,14 @@ INSERT INTO users (
 SELECT 
     md5(random()::text || clock_timestamp()::text)::uuid,
     'Cliente Demo', 
-    'cliente@barberiaRD.com', 
+    'cliente@stylex.app', 
     '809-876-5432', 
     '$2b$10$KJ.VhG3PJ.P5TF15SQjDtu1RAWgtBK0h5J9QRUZ9o9kLx3NjkMKfu', -- 'Cliente123!'
     'client',
     CURRENT_TIMESTAMP,
     CURRENT_TIMESTAMP
 WHERE NOT EXISTS (
-    SELECT 1 FROM users WHERE email = 'cliente@barberiaRD.com'
+    SELECT 1 FROM users WHERE email = 'cliente@stylex.app'
 );
 
 -- 6. Asignar una barbería al barbero de demostración si es necesario
@@ -124,7 +124,7 @@ DECLARE
     shop_id INTEGER;
 BEGIN
     -- Obtener el ID del barbero
-    SELECT id INTO barber_user_id FROM users WHERE email = 'barber@barberiaRD.com';
+    SELECT id INTO barber_user_id FROM users WHERE email = 'barber@stylex.app';
     
     -- Verificar si existe alguna barbería
     SELECT id INTO shop_id FROM barber_shops LIMIT 1;
@@ -142,7 +142,7 @@ DECLARE
     shop_id INTEGER;
 BEGIN
     -- Obtener el ID del propietario
-    SELECT id INTO owner_user_id FROM users WHERE email = 'owner@barberiaRD.com';
+    SELECT id INTO owner_user_id FROM users WHERE email = 'owner@stylex.app';
     
     -- Verificar si existe alguna barbería sin propietario
     SELECT id INTO shop_id FROM barber_shops WHERE owner_id IS NULL LIMIT 1;
@@ -175,5 +175,5 @@ TRUNCATE TABLE sessions;
 
 -- Confirmar cambios
 SELECT id, name, email, role FROM users WHERE 
-email IN ('admin@barberiaRD.com', 'owner@barberiaRD.com', 'barber@barberiaRD.com', 'cliente@barberiaRD.com')
+email IN ('admin@stylex.app', 'owner@stylex.app', 'barber@stylex.app', 'cliente@stylex.app')
 OR role IN ('admin', 'owner');

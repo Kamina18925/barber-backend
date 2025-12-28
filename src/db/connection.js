@@ -6,12 +6,68 @@ dotenv.config();
 const { Pool } = pg;
 
 // Create a new pool using environment variables
+const host = process.env.DB_HOST || 'localhost';
+const port = process.env.DB_PORT != null ? Number(process.env.DB_PORT) : 5432;
+const database = process.env.DB_NAME || 'barberia_rd';
+const user = process.env.DB_USER || 'postgres';
+const password = process.env.DB_PASSWORD || 'postgres';
+
+const isLocalHost = (value) => {
+  const v = String(value || '').trim().toLowerCase();
+  return v === 'localhost' || v === '127.0.0.1';
+};
+
+const dbSslFlag = String(process.env.DB_SSL || '').trim().toLowerCase();
+const shouldUseSsl = dbSslFlag === 'false'
+  ? false
+  : dbSslFlag === 'true'
+    ? true
+    : !!process.env.DATABASE_URL
+      ? true
+      : !isLocalHost(host);
+
+const poolConfig = process.env.DATABASE_URL
+  ? {
+      connectionString: process.env.DATABASE_URL,
+    }
+  : {
+      host,
+      port,
+      database,
+      user,
+      password,
+    };
+
 const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
+  ...poolConfig,
+  ssl: shouldUseSsl ? { rejectUnauthorized: false } : undefined,
+  connectionTimeoutMillis: process.env.DB_CONNECTION_TIMEOUT_MS != null
+    ? Number(process.env.DB_CONNECTION_TIMEOUT_MS)
+    : 4000,
+  idleTimeoutMillis: process.env.DB_IDLE_TIMEOUT_MS != null
+    ? Number(process.env.DB_IDLE_TIMEOUT_MS)
+    : 30000,
+});
+
+console.log(
+  '[DB] pool initialized:',
+  JSON.stringify(
+    {
+      usingDatabaseUrl: !!process.env.DATABASE_URL,
+      host,
+      port,
+      database,
+      ssl: shouldUseSsl,
+      connectionTimeoutMillis: pool.options?.connectionTimeoutMillis,
+      idleTimeoutMillis: pool.options?.idleTimeoutMillis,
+    },
+    null,
+    2
+  )
+);
+
+pool.on('error', (error) => {
+  console.error('[DB] Unexpected error on idle client:', error);
 });
 
 // Connect to the database

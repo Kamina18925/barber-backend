@@ -19,7 +19,9 @@ export const getAllUsers = async (req, res) => {
         role,
         can_delete_history,
         shop_id,
-        photo_url
+        photo_url,
+        whatsapp_link,
+        gender
       FROM users
       ORDER BY name
     `);
@@ -39,7 +41,7 @@ export const getUserById = async (req, res) => {
     const { id } = req.params;
     
     const result = await pool.query(`
-      SELECT id, name as nombre, email, phone as telefono, role
+      SELECT id, name as nombre, email, phone as telefono, role, whatsapp_link, photo_url, gender
       FROM users
       WHERE id = $1
     `, [id]);
@@ -56,6 +58,133 @@ export const getUserById = async (req, res) => {
   } catch (error) {
     console.error('Error al obtener usuario por ID:', error);
     res.status(500).json({ message: 'Error del servidor al obtener usuario' });
+  }
+};
+
+export const updateUserProfile = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const {
+      nombre,
+      name,
+      telefono,
+      phone,
+      photoUrl,
+      photo_url,
+      currentPassword,
+      contrasenaActual
+    } = req.body || {};
+
+    const currentPwd = currentPassword || contrasenaActual;
+
+    if (!currentPwd) {
+      return res.status(400).json({ message: 'Debes ingresar tu contraseña actual para guardar cambios.' });
+    }
+
+    await client.query('BEGIN');
+
+    const existingResult = await client.query('SELECT * FROM users WHERE id = $1', [id]);
+    if (existingResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+
+    const existing = existingResult.rows[0];
+    const ok = await bcrypt.compare(currentPwd, existing.password);
+    if (!ok) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ message: 'Contraseña actual incorrecta' });
+    }
+
+    const finalName = (nombre || name || existing.name || '').trim();
+    const finalPhone = (telefono || phone || existing.phone || '').trim();
+    const nextPhotoUrl = (photoUrl !== undefined || photo_url !== undefined)
+      ? (photoUrl || photo_url || null)
+      : existing.photo_url;
+
+    const result = await client.query(
+      `UPDATE users
+       SET name = $1,
+           phone = $2,
+           photo_url = $3,
+           updated_at = NOW()
+       WHERE id = $4
+       RETURNING id, uuid, name, email, phone, role, shop_id, photo_url, whatsapp_link, created_at, updated_at`,
+      [finalName, finalPhone, nextPhotoUrl, id]
+    );
+
+    await client.query('COMMIT');
+    res.json(result.rows[0]);
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // ignore
+    }
+    console.error('Error al actualizar perfil:', error);
+    res.status(500).json({ message: 'Error del servidor al actualizar perfil' });
+  } finally {
+    client.release();
+  }
+};
+
+export const changeUserPassword = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const {
+      currentPassword,
+      contrasenaActual,
+      newPassword,
+      nuevaContrasena
+    } = req.body || {};
+
+    const currentPwd = currentPassword || contrasenaActual;
+    const nextPwd = newPassword || nuevaContrasena;
+
+    if (!currentPwd || !nextPwd) {
+      return res.status(400).json({ message: 'Debes enviar contraseña actual y nueva contraseña.' });
+    }
+
+    await client.query('BEGIN');
+
+    const existingResult = await client.query('SELECT id, password FROM users WHERE id = $1', [id]);
+    if (existingResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
+
+    const existing = existingResult.rows[0];
+    const ok = await bcrypt.compare(currentPwd, existing.password);
+    if (!ok) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ message: 'Contraseña actual incorrecta' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(nextPwd, salt);
+
+    await client.query(
+      `UPDATE users
+       SET password = $1,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [hashedPassword, id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // ignore
+    }
+    console.error('Error al cambiar contraseña:', error);
+    res.status(500).json({ message: 'Error del servidor al cambiar contraseña' });
+  } finally {
+    client.release();
   }
 };
 
@@ -77,15 +206,31 @@ export const createUser = async (req, res) => {
       phone,
       role,
       rol,
+      whatsappLink,
+      whatsapp_link,
       photoUrl,
-      photo_url
+      photo_url,
+      gender,
+      genero,
+      sexo
     } = req.body;
 
     // Normalizar campos para aceptar tanto español como inglés
     const finalName = nombre || name;
     const finalPhone = telefono || phone;
     const finalPhotoUrl = photoUrl || photo_url || null;
+    const finalWhatsappLink = (whatsappLink !== undefined)
+      ? whatsappLink
+      : (whatsapp_link !== undefined ? whatsapp_link : null);
     const finalRole = (rol || role || 'client').toLowerCase();
+
+    const rawGender = (gender !== undefined ? gender : (genero !== undefined ? genero : sexo));
+    const normalizedGender = rawGender == null
+      ? null
+      : String(rawGender || '').trim().toLowerCase();
+    const finalGender = (normalizedGender === 'male' || normalizedGender === 'female' || normalizedGender === 'other')
+      ? normalizedGender
+      : null;
     
     // Verificar si el email ya existe
     const emailCheck = await client.query('SELECT * FROM users WHERE email = $1', [email]);
@@ -110,17 +255,21 @@ export const createUser = async (req, res) => {
         password,
         phone,
         role,
-        photo_url
+        photo_url,
+        whatsapp_link,
+        gender
       ) 
-        VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id, name as nombre, email, phone as telefono, role, photo_url
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING id, name as nombre, email, phone as telefono, role, photo_url, whatsapp_link, gender
     `, [
       finalName,
       email,
       hashedPassword,
       finalPhone,
       finalRole,
-      finalPhotoUrl
+      finalPhotoUrl,
+      finalWhatsappLink != null ? String(finalWhatsappLink) : null,
+      finalGender
     ]);
     
     logDbSuccess('INSERT', `Usuario creado con éxito: ID=${result.rows[0].id}, Nombre=${result.rows[0].nombre}`);
@@ -158,8 +307,13 @@ export const updateUser = async (req, res) => {
       shopId,
       canDeleteHistory,
       can_delete_history,
+      whatsappLink,
+      whatsapp_link,
       photoUrl,
-      photo_url
+      photo_url,
+      gender,
+      genero,
+      sexo
     } = req.body;
 
     console.log('updateUser - cuerpo recibido:', req.body);
@@ -194,6 +348,18 @@ export const updateUser = async (req, res) => {
     const finalPhotoUrl = (photoUrl !== undefined || photo_url !== undefined)
       ? (photoUrl || photo_url || null)
       : existing.photo_url;
+
+    const finalWhatsappLink = (whatsappLink !== undefined || whatsapp_link !== undefined)
+      ? String((whatsappLink !== undefined ? whatsappLink : whatsapp_link) || '')
+      : existing.whatsapp_link;
+
+    const rawGender = (gender !== undefined ? gender : (genero !== undefined ? genero : sexo));
+    const normalizedGender = rawGender === undefined
+      ? existing.gender
+      : (rawGender == null ? null : String(rawGender || '').trim().toLowerCase());
+    const finalGender = (normalizedGender === 'male' || normalizedGender === 'female' || normalizedGender === 'other' || normalizedGender == null)
+      ? normalizedGender
+      : existing.gender;
 
     // ShopId: admitir tanto shop_id como shopId y permitir null para "no asignado"
     let finalShopId;
@@ -243,9 +409,11 @@ export const updateUser = async (req, res) => {
         shop_id = $6,
         photo_url = $7,
         can_delete_history = $8,
+        whatsapp_link = $9,
+        gender = $10,
         updated_at = NOW()
-      WHERE id = $9
-      RETURNING id, uuid, name, email, phone, role, shop_id, photo_url, can_delete_history, created_at, updated_at
+      WHERE id = $11
+      RETURNING id, uuid, name, email, phone, role, shop_id, photo_url, can_delete_history, whatsapp_link, gender, created_at, updated_at
     `;
 
     const updateValues = [
@@ -257,6 +425,8 @@ export const updateUser = async (req, res) => {
       finalShopId,
       finalPhotoUrl,
       finalCanDeleteHistory,
+      finalWhatsappLink,
+      finalGender,
       id
     ];
 
@@ -388,10 +558,10 @@ export const loginUser = async (req, res) => {
     
     if (!isPasswordValid) {
       // Solo para depuración - comprobar si es contraseña de test
-      if ((email === 'admin@barberiaRD.com' && password === 'Admin123!') ||
-          (email === 'owner@barberiaRD.com' && password === 'Admin123!') ||
-          (email === 'barber@barberiaRD.com' && password === 'Barber123!') ||
-          (email === 'cliente@barberiaRD.com' && password === 'Cliente123!')) {
+      if ((email === 'admin@stylex.app' && password === 'Admin123!') ||
+          (email === 'owner@stylex.app' && password === 'Admin123!') ||
+          (email === 'barber@stylex.app' && password === 'Barber123!') ||
+          (email === 'cliente@stylex.app' && password === 'Cliente123!')) {
         // Permitir login con contraseñas de test (solo para propósitos de demostración)
         console.log('Login permitido con credenciales de test - SOLO PARA DEMOSTRACIÓN');
         isPasswordValid = true;
@@ -417,7 +587,12 @@ export const loginUser = async (req, res) => {
       role: user.role,
       especialidades: user.specialties || [],
       specialties: user.specialties || [],
-      shop_id: user.shop_id
+      shop_id: user.shop_id,
+      photo_url: user.photo_url,
+      photoUrl: user.photo_url,
+      whatsapp_link: user.whatsapp_link,
+      whatsappLink: user.whatsapp_link,
+      gender: user.gender
     };
     
     logDbSuccess('RESPUESTA', `Datos de usuario formateados y enviados: ID=${user.id}`);

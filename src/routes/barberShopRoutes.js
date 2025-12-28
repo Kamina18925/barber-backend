@@ -3,6 +3,8 @@ import {
   getAllBarberShops,
   getBarberShopsByOwner,
   getBarberShopById,
+  getBarberShopReviews,
+  addBarberShopReview,
   createBarberShop,
   updateBarberShop,
   deleteBarberShop
@@ -13,6 +15,8 @@ const router = express.Router();
 // Rutas para barberías
 router.get('/', getAllBarberShops);
 router.get('/owner/:ownerId', getBarberShopsByOwner);
+router.get('/:id/reviews', getBarberShopReviews);
+router.post('/:id/reviews', addBarberShopReview);
 router.get('/:id', getBarberShopById);
 router.post('/', createBarberShop);
 router.put('/:id', updateBarberShop);

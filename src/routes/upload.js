@@ -40,6 +40,10 @@ const storage = multer.diskStorage({
     if (req.originalUrl.includes('/shop')) {
       folder = 'shop';
     }
+
+    if (req.originalUrl.includes('/profile')) {
+      folder = 'profile';
+    }
     
     const uploadPath = path.join(UPLOADS_BASE_DIR, folder);
     console.log(`Guardando archivo en: ${uploadPath}`);
@@ -109,6 +113,32 @@ router.post('/', (req, res) => {
     console.log(`URL accesible: ${fileUrl}`);
     
     // Enviar respuesta con URL del archivo
+    res.json({
+      url: fileUrl,
+      filename: req.file.filename,
+      size: req.file.size,
+      mimetype: req.file.mimetype
+    });
+  });
+});
+
+router.post('/profile', (req, res) => {
+  console.log('Recibiendo solicitud para imagen de perfil');
+
+  upload.single('image')(req, res, (err) => {
+    if (err) {
+      console.error('Error en upload/profile:', err);
+      return res.status(400).json({ error: err.message || 'Error al subir imagen de perfil' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No se recibió ningún archivo' });
+    }
+
+    console.log('Imagen de perfil recibida:', req.file.filename);
+
+    const fileUrl = `/uploads/profile/${req.file.filename}`;
+
     res.json({
       url: fileUrl,
       filename: req.file.filename,

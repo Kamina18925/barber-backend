@@ -8,6 +8,7 @@ CREATE TABLE users (
     name VARCHAR(100) NOT NULL,
     email VARCHAR(100) UNIQUE NOT NULL,
     phone VARCHAR(20),
+    gender VARCHAR(10),
     password VARCHAR(100) NOT NULL,
     role VARCHAR(20) NOT NULL, -- 'barber', 'client', 'owner'
     specialties TEXT[],
@@ -22,6 +23,7 @@ CREATE TABLE barber_shops (
     name VARCHAR(100) NOT NULL,
     address VARCHAR(200),
     schedule JSONB,
+    categories TEXT[] DEFAULT ARRAY['barberia'],
     rating NUMERIC(2,1),
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()

@@ -9,6 +9,8 @@ import {
   updateAppointment,
   cancelAppointment,
   completeAppointment,
+  updateAppointmentPayment,
+  updateAppointmentBarberNotes,
   markNoShowAppointment,
   deleteAppointmentById,
   deleteAppointmentsByClientAndStatus,
@@ -30,6 +32,8 @@ router.post('/', createAppointment);
 router.put('/:id', updateAppointment);
 router.put('/:id/cancel', cancelAppointment);
 router.put('/:id/complete', completeAppointment);
+router.put('/:id/payment', updateAppointmentPayment);
+router.put('/:id/notes', updateAppointmentBarberNotes);
 router.put('/:id/no-show', markNoShowAppointment);
 router.post('/:id/propose-advance', proposeAdvanceAppointment);
 

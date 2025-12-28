@@ -93,9 +93,16 @@ export const getAllAppointments = async (req, res) => {
         a.id,
         a.uuid,
         a.date,
+        a.actual_end_time,
         a.hidden_for_client,
+        COALESCE(a.client_reviewed, FALSE) as client_reviewed,
         a.status,
         a.notes,
+        a.notes_barber,
+        a.payment_method,
+        a.payment_status,
+        a.payment_marked_at,
+        a.payment_marked_by,
         a.shop_id,
         a.barber_id,
         a.client_id,
@@ -116,6 +123,76 @@ export const getAllAppointments = async (req, res) => {
   } catch (error) {
     console.error('Error al obtener citas:', error);
     res.status(500).json({ message: 'Error del servidor al obtener citas' });
+  }
+};
+
+export const updateAppointmentBarberNotes = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { id } = req.params;
+    const { notes, notesBarber, notes_barber, requesterId, requesterRole } = req.body || {};
+
+    const finalNotes =
+      notes !== undefined
+        ? notes
+        : (notesBarber !== undefined ? notesBarber : notes_barber);
+
+    const apptRes = await client.query(
+      `SELECT id, barber_id, shop_id
+       FROM appointments
+       WHERE id = $1`,
+      [id]
+    );
+
+    if (apptRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Cita no encontrada' });
+    }
+
+    const appt = apptRes.rows[0];
+    const role = String(requesterRole || '').toLowerCase();
+    const rid = requesterId != null ? String(requesterId) : null;
+
+    let authorized = false;
+    if (role.includes('admin')) authorized = true;
+    else if (role.includes('barber')) authorized = rid != null && String(appt.barber_id) === rid;
+    else if (role.includes('owner')) {
+      if (rid != null) {
+        const ownRes = await client.query(
+          `SELECT 1
+           FROM barber_shops bs
+           WHERE bs.id = $1 AND bs.owner_id = $2
+           LIMIT 1`,
+          [appt.shop_id, rid]
+        );
+        authorized = ownRes.rows.length > 0;
+      }
+    }
+
+    if (!authorized) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'No autorizado para actualizar notas de esta cita' });
+    }
+
+    const result = await client.query(
+      `UPDATE appointments
+       SET notes_barber = $1,
+           updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, date, actual_end_time, status, notes, notes_barber, client_id, barber_id, shop_id, service_id, payment_method, payment_status, payment_marked_at, payment_marked_by`,
+      [finalNotes ?? null, id]
+    );
+
+    await client.query('COMMIT');
+    return res.json(result.rows[0]);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error al actualizar notas del barbero:', error);
+    return res.status(500).json({ message: 'Error del servidor al actualizar notas del barbero' });
+  } finally {
+    client.release();
   }
 };
 
@@ -360,9 +437,16 @@ export const getAppointmentsByClient = async (req, res) => {
         a.id,
         a.uuid,
         a.date,
+        a.actual_end_time,
         a.hidden_for_client,
+        COALESCE(a.client_reviewed, FALSE) as client_reviewed,
         a.status,
         a.notes,
+        a.notes_barber,
+        a.payment_method,
+        a.payment_status,
+        a.payment_marked_at,
+        a.payment_marked_by,
         a.shop_id,
         a.barber_id,
         a.client_id,
@@ -392,15 +476,15 @@ export const getAppointmentsByBarber = async (req, res) => {
     
     const result = await pool.query(`
       SELECT a.*,
-             c.nombre as client_name,
-             s.nombre as service_name,
-             bs.nombre as shop_name
+             c.name as client_name,
+             s.name as service_name,
+             bs.name as shop_name
       FROM appointments a
       LEFT JOIN users c ON a.client_id = c.id
       LEFT JOIN services s ON a.service_id = s.id
       LEFT JOIN barber_shops bs ON a.shop_id = bs.id
       WHERE a.barber_id = $1
-      ORDER BY a.fecha DESC, a.hora
+      ORDER BY a.date DESC
     `, [barberId]);
     
     res.json(result.rows);
@@ -417,15 +501,15 @@ export const getAppointmentsByShop = async (req, res) => {
     
     const result = await pool.query(`
       SELECT a.*,
-             c.nombre as client_name,
-             b.nombre as barber_name,
-             s.nombre as service_name
+             c.name as client_name,
+             b.name as barber_name,
+             s.name as service_name
       FROM appointments a
       LEFT JOIN users c ON a.client_id = c.id
       LEFT JOIN users b ON a.barber_id = b.id
       LEFT JOIN services s ON a.service_id = s.id
       WHERE a.shop_id = $1
-      ORDER BY a.fecha DESC, a.hora
+      ORDER BY a.date DESC
     `, [shopId]);
     
     res.json(result.rows);
@@ -439,20 +523,23 @@ export const getAppointmentsByShop = async (req, res) => {
 export const getAppointmentById = async (req, res) => {
   try {
     const { id } = req.params;
+    const isNumericId = /^[0-9]+$/.test(String(id));
     
-    const result = await pool.query(`
-      SELECT a.*,
-             c.nombre as client_name,
-             b.nombre as barber_name,
-             s.nombre as service_name,
-             bs.nombre as shop_name
-      FROM appointments a
-      LEFT JOIN users c ON a.client_id = c.id
-      LEFT JOIN users b ON a.barber_id = b.id
-      LEFT JOIN services s ON a.service_id = s.id
-      LEFT JOIN barber_shops bs ON a.shop_id = bs.id
-      WHERE a.id = $1 OR a.uuid = $1
-    `, [id]);
+    const result = await pool.query(
+      `SELECT a.*,
+              c.name as client_name,
+              b.name as barber_name,
+              s.name as service_name,
+              bs.name as shop_name
+       FROM appointments a
+       LEFT JOIN users c ON a.client_id = c.id
+       LEFT JOIN users b ON a.barber_id = b.id
+       LEFT JOIN services s ON a.service_id = s.id
+       LEFT JOIN barber_shops bs ON a.shop_id = bs.id
+       WHERE ${isNumericId ? 'a.id = $1' : 'a.uuid = $1'}
+      `,
+      [id]
+    );
     
     if (result.rows.length === 0) {
       return res.status(404).json({ message: 'Cita no encontrada' });
@@ -504,6 +591,26 @@ export const createAppointment = async (req, res) => {
     if (!finalDate || !normalizedDate || !finalClientId || !finalBarberId || !finalShopId || !finalServiceId) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Datos incompletos para crear la cita' });
+    }
+
+    if (finalStatus === 'confirmed') {
+      const duplicateServiceCheck = await client.query(
+        `SELECT id
+         FROM appointments
+         WHERE client_id = $1
+           AND service_id = $2
+           AND status = 'confirmed'
+           AND DATE(date AT TIME ZONE 'UTC' AT TIME ZONE 'America/Santo_Domingo') = DATE($3 AT TIME ZONE 'UTC' AT TIME ZONE 'America/Santo_Domingo')
+         LIMIT 1`,
+        [finalClientId, finalServiceId, normalizedDate]
+      );
+
+      if (duplicateServiceCheck.rows.length > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          message: 'Ya tienes una cita activa para este servicio hoy. Elige otro servicio o cancela la cita actual.',
+        });
+      }
     }
     
     // Verificar que el barbero no tenga ya una cita en ese mismo instante (slot ocupado)
@@ -1018,9 +1125,11 @@ export const completeAppointment = async (req, res) => {
 
     const result = await client.query(
       `UPDATE appointments 
-       SET status = 'completed', updated_at = NOW()
+       SET status = 'completed',
+           actual_end_time = COALESCE(actual_end_time, NOW()),
+           updated_at = NOW()
        WHERE id = $1
-       RETURNING id, date, status, notes, client_id, barber_id, shop_id, service_id`,
+       RETURNING id, date, actual_end_time, status, notes, client_id, barber_id, shop_id, service_id, payment_method, payment_status, payment_marked_at, payment_marked_by`,
       [id]
     );
 
@@ -1031,6 +1140,102 @@ export const completeAppointment = async (req, res) => {
     await client.query('ROLLBACK');
     console.error('Error al marcar cita como completada:', error);
     return res.status(500).json({ message: 'Error del servidor al marcar cita como completada' });
+  } finally {
+    client.release();
+  }
+};
+
+export const updateAppointmentPayment = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { id } = req.params;
+    const {
+      paymentMethod,
+      payment_method,
+      paymentStatus,
+      payment_status,
+      requesterId,
+      requesterRole,
+    } = req.body || {};
+
+    const finalPaymentMethod = paymentMethod !== undefined ? paymentMethod : payment_method;
+    const finalPaymentStatus = paymentStatus !== undefined ? paymentStatus : payment_status;
+
+    const allowedStatuses = ['paid', 'unpaid', 'pending', null, undefined, ''];
+    const allowedMethods = ['cash', 'card', 'transfer', null, undefined, ''];
+    const normalizedStatus = String(finalPaymentStatus || '').trim().toLowerCase();
+    const normalizedMethod = String(finalPaymentMethod || '').trim().toLowerCase();
+
+    if (!allowedStatuses.includes(finalPaymentStatus) && normalizedStatus) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'paymentStatus inválido. Usa: paid | unpaid | pending' });
+    }
+
+    if (!allowedMethods.includes(finalPaymentMethod) && normalizedMethod) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'paymentMethod inválido. Usa: cash | card | transfer' });
+    }
+
+    const apptRes = await client.query(
+      `SELECT id, barber_id, shop_id
+       FROM appointments
+       WHERE id = $1`,
+      [id]
+    );
+
+    if (apptRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Cita no encontrada' });
+    }
+
+    const appt = apptRes.rows[0];
+    const role = String(requesterRole || '').toLowerCase();
+    const rid = requesterId != null ? String(requesterId) : null;
+
+    let authorized = false;
+    if (role.includes('admin')) authorized = true;
+    else if (role.includes('barber')) authorized = rid != null && String(appt.barber_id) === rid;
+    else if (role.includes('owner')) {
+      if (rid != null) {
+        const ownRes = await client.query(
+          `SELECT 1
+           FROM barber_shops bs
+           WHERE bs.id = $1 AND bs.owner_id = $2
+           LIMIT 1`,
+          [appt.shop_id, rid]
+        );
+        authorized = ownRes.rows.length > 0;
+      }
+    }
+
+    if (!authorized) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'No autorizado para actualizar el pago de esta cita' });
+    }
+
+    const methodValue = normalizedMethod ? normalizedMethod : null;
+    const statusValue = normalizedStatus ? normalizedStatus : null;
+
+    const result = await client.query(
+      `UPDATE appointments
+       SET payment_method = $1,
+           payment_status = $2,
+           payment_marked_at = NOW(),
+           payment_marked_by = $3,
+           updated_at = NOW()
+       WHERE id = $4
+       RETURNING id, date, actual_end_time, status, notes, client_id, barber_id, shop_id, service_id, payment_method, payment_status, payment_marked_at, payment_marked_by`,
+      [methodValue, statusValue, requesterId ?? null, id]
+    );
+
+    await client.query('COMMIT');
+    return res.json(result.rows[0]);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error al actualizar pago de cita:', error);
+    return res.status(500).json({ message: 'Error del servidor al actualizar pago de cita' });
   } finally {
     client.release();
   }
