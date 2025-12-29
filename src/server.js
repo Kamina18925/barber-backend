@@ -405,7 +405,7 @@ const startServer = async () => {
   }
 
   // Limpieza periódica (cada 12 horas)
-  setInterval(async () => {
+  const cleanupIntervalId = setInterval(async () => {
     try {
       await cleanupDeletedNotifications();
       await cleanupChatMessagesByRetention();
@@ -415,9 +415,48 @@ const startServer = async () => {
   }, 12 * 60 * 60 * 1000);
 
   // Iniciar servidor
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`Servidor corriendo en el puerto ${PORT}`);
     console.log(`API disponible en http://localhost:${PORT}/api`);
+  });
+
+  const shutdown = async (exitCode = 0) => {
+    try {
+      clearInterval(cleanupIntervalId);
+    } catch (e) {
+    }
+
+    try {
+      await new Promise((resolve) => server.close(() => resolve()));
+    } catch (e) {
+    }
+
+    try {
+      await pool.end();
+    } catch (e) {
+    }
+
+    process.exit(exitCode);
+  };
+
+  server.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+      console.error(`Error: el puerto ${PORT} ya está en uso. Cierra el proceso que lo esté usando y vuelve a intentar.`);
+      return shutdown(1);
+    }
+    console.error('Error del servidor HTTP:', err);
+    return shutdown(1);
+  });
+
+  process.once('SIGINT', () => void shutdown(0));
+  process.once('SIGTERM', () => void shutdown(0));
+  process.once('uncaughtException', (err) => {
+    console.error('uncaughtException:', err);
+    void shutdown(1);
+  });
+  process.once('unhandledRejection', (reason) => {
+    console.error('unhandledRejection:', reason);
+    void shutdown(1);
   });
 };
 

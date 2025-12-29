@@ -41,9 +41,18 @@ const poolConfig = process.env.DATABASE_URL
 const pool = new Pool({
   ...poolConfig,
   ssl: shouldUseSsl ? { rejectUnauthorized: false } : undefined,
+  max: process.env.DB_POOL_MAX != null
+    ? Number(process.env.DB_POOL_MAX)
+    : 10,
+  keepAlive: process.env.DB_KEEP_ALIVE != null
+    ? String(process.env.DB_KEEP_ALIVE).trim().toLowerCase() !== 'false'
+    : true,
+  keepAliveInitialDelayMillis: process.env.DB_KEEP_ALIVE_DELAY_MS != null
+    ? Number(process.env.DB_KEEP_ALIVE_DELAY_MS)
+    : 10000,
   connectionTimeoutMillis: process.env.DB_CONNECTION_TIMEOUT_MS != null
     ? Number(process.env.DB_CONNECTION_TIMEOUT_MS)
-    : 4000,
+    : 15000,
   idleTimeoutMillis: process.env.DB_IDLE_TIMEOUT_MS != null
     ? Number(process.env.DB_IDLE_TIMEOUT_MS)
     : 30000,
@@ -58,6 +67,9 @@ console.log(
       port,
       database,
       ssl: shouldUseSsl,
+      max: pool.options?.max,
+      keepAlive: pool.options?.keepAlive,
+      keepAliveInitialDelayMillis: pool.options?.keepAliveInitialDelayMillis,
       connectionTimeoutMillis: pool.options?.connectionTimeoutMillis,
       idleTimeoutMillis: pool.options?.idleTimeoutMillis,
     },

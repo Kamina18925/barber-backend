@@ -25,23 +25,24 @@ router.put('/by-shop/:shopId', async (req, res) => {
     return res.status(400).json({ message: 'barberServices es obligatorio y debe ser un objeto' });
   }
 
+  const client = await pool.connect();
   try {
-    await pool.query('BEGIN');
+    await client.query('BEGIN');
 
     // Obtener todos los barberos de esa barbería
-    const barbersResult = await pool.query(
+    const barbersResult = await client.query(
       'SELECT id FROM users WHERE role LIKE $1 AND shop_id = $2',
       ['%barber%', shopId]
     );
     const barberIds = barbersResult.rows.map(r => r.id);
 
     if (barberIds.length === 0) {
-      await pool.query('COMMIT');
+      await client.query('COMMIT');
       return res.json({ message: 'No hay barberos para esta barbería', barberIds: [] });
     }
 
     // Eliminar relaciones actuales de esos barberos
-    await pool.query(
+    await client.query(
       'DELETE FROM barber_services WHERE barber_id::text = ANY($1::text[])',
       [barberIds.map(x => String(x))]
     );
@@ -60,18 +61,20 @@ router.put('/by-shop/:shopId', async (req, res) => {
     }
 
     for (const row of inserts) {
-      await pool.query(
+      await client.query(
         'INSERT INTO barber_services (barber_id, service_id) VALUES ($1, $2) ON CONFLICT (barber_id, service_id) DO NOTHING',
         [row.barberId, row.serviceId]
       );
     }
 
-    await pool.query('COMMIT');
+    await client.query('COMMIT');
     return res.json({ message: 'Servicios por barbero actualizados', count: inserts.length });
   } catch (error) {
-    await pool.query('ROLLBACK');
+    await client.query('ROLLBACK');
     console.error('Error al actualizar barber_services por barbería:', error);
     return res.status(500).json({ message: 'Error al guardar servicios por barbero' });
+  } finally {
+    client.release();
   }
 });
 
