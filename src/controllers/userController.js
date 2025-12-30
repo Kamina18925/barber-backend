@@ -7,31 +7,108 @@ const logDbSuccess = (operation, details = '') => {
   console.log(`[${timestamp}] ✅ DB OPERACIÓN EXITOSA: ${operation} ${details ? '- ' + details : ''}`);
 };
 
+const isTransientConnectionError = (error) => {
+  const msg = String(error?.message || '');
+  const code = String(error?.code || '');
+  return (
+    msg.includes('Connection terminated unexpectedly') ||
+    msg.includes('terminating connection') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('Query read timeout') ||
+    msg.includes('timeout') ||
+    code === '57P01' ||
+    code === '57P02' ||
+    code === '57P03'
+  );
+};
+
+const queryWithRetry = async (text, params, queryTimeoutMs) => {
+  const delaysMs = [0, 250];
+  let lastError;
+
+  for (const delay of delaysMs) {
+    if (delay > 0) {
+      await new Promise((r) => setTimeout(r, delay));
+    }
+
+    let client;
+    try {
+      client = await Promise.race([
+        pool.connect(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('connect_timeout')), 2500)),
+      ]);
+    } catch (error) {
+      lastError = error;
+      if (!isTransientConnectionError(error)) throw error;
+      continue;
+    }
+    try {
+      return await client.query({
+        text,
+        values: params,
+        ...(queryTimeoutMs != null ? { query_timeout: queryTimeoutMs } : {}),
+      });
+    } catch (error) {
+      lastError = error;
+      if (!isTransientConnectionError(error)) throw error;
+    } finally {
+      try {
+        client.release();
+      } catch {
+      }
+    }
+  }
+
+  throw lastError;
+};
+
+let __usersCache = null;
+let __usersCacheAtMs = 0;
+const USERS_CACHE_TTL_MS = 60000;
+const USERS_QUERY_TIMEOUT_MS = 2500;
+
 // Obtener todos los usuarios
 export const getAllUsers = async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT 
-        id,
-        name as nombre,
-        email,
-        phone as telefono,
-        role,
-        can_delete_history,
-        shop_id,
-        photo_url,
-        whatsapp_link,
-        gender
-      FROM users
-      ORDER BY name
-    `);
-    
+    const nowMs = Date.now();
+    if (Array.isArray(__usersCache) && nowMs - __usersCacheAtMs < USERS_CACHE_TTL_MS) {
+      return res.json(__usersCache);
+    }
+
+    const result = await queryWithRetry(
+      `
+        SELECT 
+          id,
+          name as nombre,
+          email,
+          phone as telefono,
+          role,
+          can_delete_history,
+          shop_id,
+          photo_url,
+          whatsapp_link,
+          gender
+        FROM users
+        ORDER BY name
+      `,
+      [],
+      USERS_QUERY_TIMEOUT_MS
+    );
+
     logDbSuccess('SELECT', `Obtenidos ${result.rows.length} usuarios correctamente`);
-    
+
+    __usersCache = result.rows;
+    __usersCacheAtMs = Date.now();
+
     res.json(result.rows);
   } catch (error) {
     console.error('Error al obtener usuarios:', error);
-    res.status(500).json({ message: 'Error del servidor al obtener usuarios' });
+    if (Array.isArray(__usersCache) && __usersCache.length > 0) {
+      return res.json(__usersCache);
+    }
+    // Evitar que el frontend quede colgado por timeouts cuando la BD está intermitente.
+    // El polling reintentará y llenará el estado cuando el pooler se estabilice.
+    return res.json([]);
   }
 };
 
@@ -40,11 +117,11 @@ export const getUserById = async (req, res) => {
   try {
     const { id } = req.params;
     
-    const result = await pool.query(`
+    const result = await queryWithRetry(`
       SELECT id, name as nombre, email, phone as telefono, role, whatsapp_link, photo_url, gender
       FROM users
       WHERE id = $1
-    `, [id]);
+    `, [id], USERS_QUERY_TIMEOUT_MS);
     
     logDbSuccess('SELECT', `Consulta de usuario con ID=${id} completada`);
     

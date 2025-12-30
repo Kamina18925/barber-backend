@@ -420,7 +420,7 @@ const startServer = async () => {
     console.log(`API disponible en http://localhost:${PORT}/api`);
   });
 
-  const shutdown = async (exitCode = 0) => {
+  const shutdown = async (exitCode = 0, shouldExit = true) => {
     try {
       clearInterval(cleanupIntervalId);
     } catch (e) {
@@ -436,7 +436,9 @@ const startServer = async () => {
     } catch (e) {
     }
 
-    process.exit(exitCode);
+    if (shouldExit) {
+      process.exit(exitCode);
+    }
   };
 
   server.on('error', (err) => {
