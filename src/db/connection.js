@@ -52,7 +52,7 @@ const pool = new Pool({
     : 10000,
   connectionTimeoutMillis: process.env.DB_CONNECTION_TIMEOUT_MS != null
     ? Number(process.env.DB_CONNECTION_TIMEOUT_MS)
-    : 2000,
+    : 8000,
   idleTimeoutMillis: process.env.DB_IDLE_TIMEOUT_MS != null
     ? Number(process.env.DB_IDLE_TIMEOUT_MS)
     : 30000,

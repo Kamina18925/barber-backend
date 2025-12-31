@@ -193,6 +193,28 @@ const ensureCoreTablesExist = async () => {
   }
 };
 
+const ensureUsersSoftDeleteColumns = async () => {
+  try {
+    await pool.query(
+      `ALTER TABLE users
+       ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP`
+    );
+  } catch (error) {
+    console.error('Error asegurando columna deleted_at en users:', error);
+  }
+};
+
+const ensureBarberShopsSoftDeleteColumns = async () => {
+  try {
+    await pool.query(
+      `ALTER TABLE barber_shops
+       ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP`
+    );
+  } catch (error) {
+    console.error('Error asegurando columna deleted_at en barber_shops:', error);
+  }
+};
+
 const ensureNotificationSoftDeleteColumns = async () => {
   try {
     await pool.query(
@@ -353,6 +375,70 @@ const ensureReviewsColumns = async () => {
   }
 };
 
+const ensureSubscriptionTablesExist = async () => {
+  try {
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS subscriptions (
+        id SERIAL PRIMARY KEY,
+        owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'inactive',
+        current_period_start TIMESTAMP,
+        current_period_end TIMESTAMP,
+        grace_period_end TIMESTAMP,
+        last_alert_sent_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE (owner_id)
+      )`
+    );
+
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS payments (
+        id SERIAL PRIMARY KEY,
+        owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        status TEXT NOT NULL,
+        amount NUMERIC(10,2),
+        currency TEXT,
+        provider_payment_id TEXT,
+        metadata JSONB,
+        paid_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )`
+    );
+
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS manual_payment_reports (
+        id SERIAL PRIMARY KEY,
+        owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        amount NUMERIC(10,2),
+        currency TEXT,
+        reference_text TEXT,
+        proof_url TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        approved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        rejected_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        decided_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )`
+    );
+
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_payments_owner_id ON payments(owner_id)`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_manual_payment_reports_owner_id ON manual_payment_reports(owner_id)`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_manual_payment_reports_status ON manual_payment_reports(status)`
+    );
+  } catch (error) {
+    console.error('Error asegurando tablas de suscripción/pagos:', error);
+  }
+};
+
 const cleanupChatMessagesByRetention = async () => {
   const client = await pool.connect();
   try {
@@ -383,12 +469,15 @@ const cleanupChatMessagesByRetention = async () => {
 
 const startServer = async () => {
   await ensureCoreTablesExist();
+  await ensureSubscriptionTablesExist();
   await ensureNotificationSoftDeleteColumns();
   await ensureAppointmentClientHiddenColumn();
   await ensureConversationArchiveColumns();
+  await ensureUsersSoftDeleteColumns();
   await ensureUsersWhatsappLinkColumn();
   await ensureUsersPhotoUrlColumn();
   await ensureUsersGenderColumn();
+  await ensureBarberShopsSoftDeleteColumns();
   await ensureBarberShopsCategoriesColumn();
   await ensureAppointmentsClientReviewedColumn();
   await ensureAppointmentsActualEndTimeColumn();
@@ -404,62 +493,62 @@ const startServer = async () => {
     console.error('Error ejecutando cleanupDeletedNotifications al iniciar:', error);
   }
 
-  // Limpieza periódica (cada 12 horas)
-  const cleanupIntervalId = setInterval(async () => {
-    try {
-      await cleanupDeletedNotifications();
-      await cleanupChatMessagesByRetention();
-    } catch (error) {
-      console.error('Error ejecutando cleanupDeletedNotifications:', error);
-    }
-  }, 12 * 60 * 60 * 1000);
+   // Limpieza periódica (cada 12 horas)
+   const cleanupIntervalId = setInterval(async () => {
+     try {
+       await cleanupDeletedNotifications();
+       await cleanupChatMessagesByRetention();
+     } catch (error) {
+       console.error('Error ejecutando cleanupDeletedNotifications:', error);
+     }
+   }, 12 * 60 * 60 * 1000);
 
-  // Iniciar servidor
-  const server = app.listen(PORT, () => {
-    console.log(`Servidor corriendo en el puerto ${PORT}`);
-    console.log(`API disponible en http://localhost:${PORT}/api`);
-  });
+   // Iniciar servidor
+   const server = app.listen(PORT, () => {
+     console.log(`Servidor corriendo en el puerto ${PORT}`);
+     console.log(`API disponible en http://localhost:${PORT}/api`);
+   });
 
-  const shutdown = async (exitCode = 0, shouldExit = true) => {
-    try {
-      clearInterval(cleanupIntervalId);
-    } catch (e) {
-    }
+   const shutdown = async (exitCode = 0, shouldExit = true) => {
+     try {
+       clearInterval(cleanupIntervalId);
+     } catch (e) {
+     }
 
-    try {
-      await new Promise((resolve) => server.close(() => resolve()));
-    } catch (e) {
-    }
+     try {
+       await new Promise((resolve) => server.close(() => resolve()));
+     } catch (e) {
+     }
 
-    try {
-      await pool.end();
-    } catch (e) {
-    }
+     try {
+       await pool.end();
+     } catch (e) {
+     }
 
-    if (shouldExit) {
-      process.exit(exitCode);
-    }
-  };
+     if (shouldExit) {
+       process.exit(exitCode);
+     }
+   };
 
-  server.on('error', (err) => {
-    if (err && err.code === 'EADDRINUSE') {
-      console.error(`Error: el puerto ${PORT} ya está en uso. Cierra el proceso que lo esté usando y vuelve a intentar.`);
-      return shutdown(1);
-    }
-    console.error('Error del servidor HTTP:', err);
-    return shutdown(1);
-  });
+   server.on('error', (err) => {
+     if (err && err.code === 'EADDRINUSE') {
+       console.error(`Error: el puerto ${PORT} ya está en uso. Cierra el proceso que lo esté usando y vuelve a intentar.`);
+       return shutdown(1);
+     }
+     console.error('Error del servidor HTTP:', err);
+     return shutdown(1);
+   });
 
-  process.once('SIGINT', () => void shutdown(0));
-  process.once('SIGTERM', () => void shutdown(0));
-  process.once('uncaughtException', (err) => {
-    console.error('uncaughtException:', err);
-    void shutdown(1);
-  });
-  process.once('unhandledRejection', (reason) => {
-    console.error('unhandledRejection:', reason);
-    void shutdown(1);
-  });
-};
+   process.once('SIGINT', () => void shutdown(0));
+   process.once('SIGTERM', () => void shutdown(0));
+   process.once('uncaughtException', (err) => {
+     console.error('uncaughtException:', err);
+     void shutdown(1);
+   });
+   process.once('unhandledRejection', (reason) => {
+     console.error('unhandledRejection:', reason);
+     void shutdown(1);
+   });
+ };
 
-startServer();
+ startServer();

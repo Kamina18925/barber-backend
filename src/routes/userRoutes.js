@@ -1,25 +1,35 @@
 import express from 'express';
+import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
 import {
   getAllUsers,
   getUserById,
+  getCurrentUserProfile,
+  getVisibleUsers,
   createUser,
   updateUser,
   deleteUser,
   loginUser,
   updateUserProfile,
-  changeUserPassword
+  changeUserPassword,
+  deleteOwnerAccount
 } from '../controllers/userController.js';
 
 const router = express.Router();
 
 // Rutas para usuarios
-router.get('/', getAllUsers);
-router.get('/:id', getUserById);
-router.post('/', createUser);
-router.put('/:id/profile', updateUserProfile);
-router.put('/:id/change-password', changeUserPassword);
-router.put('/:id', updateUser);
-router.delete('/:id', deleteUser);
 router.post('/login', loginUser);
+
+router.post('/', createUser);
+
+router.get('/', authenticateToken, authorizeRoles('admin'), getAllUsers);
+router.get('/profile', authenticateToken, getCurrentUserProfile);
+router.get('/visible', authenticateToken, getVisibleUsers);
+router.get('/:id', authenticateToken, getUserById);
+router.put('/:id/profile', authenticateToken, updateUserProfile);
+router.put('/:id/change-password', authenticateToken, changeUserPassword);
+router.delete('/:id/owner-account', authenticateToken, deleteOwnerAccount);
+
+router.put('/:id', authenticateToken, authorizeRoles('admin'), updateUser);
+router.delete('/:id', authenticateToken, authorizeRoles('admin'), deleteUser);
 
 export default router;

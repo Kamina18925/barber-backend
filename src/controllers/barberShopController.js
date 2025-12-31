@@ -1,5 +1,6 @@
 import pool from '../db/connection.js';
 import bcrypt from 'bcrypt';
+import { enforceOwnerSubscriptionForManagement } from '../services/subscriptionService.js';
 
 const normalizeCategories = (raw) => {
   const allowed = new Set(['barberia', 'salon_belleza', 'spa_estetica', 'unas', 'depilacion']);
@@ -25,6 +26,14 @@ const normalizeCategories = (raw) => {
 // Obtener todas las barberías
 export const getAllBarberShops = async (req, res) => {
   try {
+    const includeOrphans = String(req.query?.includeOrphans ?? req.query?.include_orphans ?? '').toLowerCase() === 'true';
+    const includeArchived = String(req.query?.includeArchived ?? req.query?.include_archived ?? '').toLowerCase() === 'true';
+
+    const where = [];
+    if (!includeArchived) where.push('bs.deleted_at IS NULL');
+    if (!includeOrphans) where.push('u.id IS NOT NULL AND u.deleted_at IS NULL');
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
     const result = await pool.query(`
       SELECT 
         bs.id, 
@@ -46,6 +55,7 @@ export const getAllBarberShops = async (req, res) => {
         GROUP BY shop_id
       ) rv ON rv.shop_id = bs.id
       LEFT JOIN users u ON bs.owner_id = u.id
+      ${whereSql}
       ORDER BY bs.name
     `);
     
@@ -60,6 +70,7 @@ export const getAllBarberShops = async (req, res) => {
 export const getBarberShopsByOwner = async (req, res) => {
   try {
     const { ownerId } = req.params;
+    const includeArchived = String(req.query?.includeArchived ?? req.query?.include_archived ?? '').toLowerCase() === 'true';
     
     const result = await pool.query(`
       SELECT 
@@ -73,6 +84,7 @@ export const getBarberShopsByOwner = async (req, res) => {
         owner_id
       FROM barber_shops
       WHERE owner_id = $1
+      ${includeArchived ? '' : 'AND deleted_at IS NULL'}
       ORDER BY name
     `, [ownerId]);
     
@@ -400,6 +412,15 @@ export const createBarberShop = async (req, res) => {
       }
     }
 
+    if (ownerUserId != null) {
+      try {
+        await enforceOwnerSubscriptionForManagement(client, ownerUserId);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
     const insertResult = await client.query(
       `
       INSERT INTO barber_shops (
@@ -485,15 +506,17 @@ export const updateBarberShop = async (req, res) => {
       return res.status(404).json({ message: 'Barbería no encontrada' });
     }
 
+    const existing = checkResult.rows[0];
+
     // Normalizar campos
-    const finalName = nombre || name || checkResult.rows[0].name;
-    const finalAddress = direccion || address || checkResult.rows[0].address || '';
+    const finalName = nombre || name || existing.name;
+    const finalAddress = direccion || address || existing.address || '';
     const finalPhone = telefono || phone || null;
     const finalCity = ciudad || city || null;
     const finalEmail = email || null;
     const finalPhotoUrl = photoUrl || null;
     const finalDescription = descripcion || description || null;
-    const finalOwnerId = owner_id || ownerId || checkResult.rows[0].owner_id || null;
+    const finalOwnerId = owner_id || ownerId || existing.owner_id || null;
     const finalSchedule = horario || openHours || null;
     const finalSector = sector || null;
     const finalLatitude = latitude !== undefined ? latitude : (lat !== undefined ? lat : null);
@@ -503,11 +526,21 @@ export const updateBarberShop = async (req, res) => {
       : (whatsapp_link !== undefined ? whatsapp_link : (whatsapp !== undefined ? whatsapp : undefined));
 
     // Reconstruir schedule JSONB mezclando con el existente
-    const currentSchedule = checkResult.rows[0].schedule || {};
-    const currentCategories = Array.isArray(checkResult.rows[0].categories) && checkResult.rows[0].categories.length
-      ? checkResult.rows[0].categories
+    const currentSchedule = existing.schedule || {};
+    const currentCategories = Array.isArray(existing.categories) && existing.categories.length
+      ? existing.categories
       : ['barberia'];
     const finalCategories = categories !== undefined ? normalizeCategories(categories) : currentCategories;
+
+    const ownerToCheck = finalOwnerId != null ? finalOwnerId : (existing.owner_id ?? null);
+    if (ownerToCheck != null) {
+      try {
+        await enforceOwnerSubscriptionForManagement(client, ownerToCheck);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
     const scheduleJson = {
       ...currentSchedule,
       ...(finalSchedule !== null ? { openHours: finalSchedule } : {}),
@@ -564,6 +597,7 @@ export const deleteBarberShop = async (req, res) => {
     await client.query('BEGIN');
     
     const { id } = req.params;
+    const force = String(req.query?.force || '').toLowerCase() === 'true';
     
     // Verificar que la barbería existe
     const checkResult = await client.query('SELECT * FROM barber_shops WHERE id = $1', [id]);
@@ -572,50 +606,46 @@ export const deleteBarberShop = async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Barbería no encontrada' });
     }
+
+    const existing = checkResult.rows[0];
+    if (existing?.deleted_at) {
+      await client.query('COMMIT');
+      return res.status(204).send();
+    }
+
+    const ownerId = existing?.owner_id ?? null;
+
+    if (ownerId != null) {
+      try {
+        await enforceOwnerSubscriptionForManagement(client, ownerId);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
+    if (ownerId != null && !force) {
+      const countRes = await client.query(
+        'SELECT COUNT(*)::int as count FROM barber_shops WHERE owner_id = $1 AND deleted_at IS NULL',
+        [ownerId]
+      );
+      const count = Number(countRes.rows[0]?.count ?? 0) || 0;
+      if (count <= 1) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          message: 'Este es tu único negocio. No puedes eliminarlo. Si deseas cerrarlo, elimina tu cuenta.'
+        });
+      }
+    }
     
     // Desasignar barberos de esta barbería (poner shop_id a NULL)
     await client.query('UPDATE users SET shop_id = NULL WHERE shop_id = $1', [id]);
 
+    // Archivar la barbería (soft delete). Se conserva el historial (citas, reseñas, etc.).
     await client.query(
-      `
-      DELETE FROM appointment_notes
-      WHERE appointment_id IN (SELECT id FROM appointments WHERE shop_id = $1)
-      `,
+      'UPDATE barber_shops SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1',
       [id]
     );
-
-    await client.query(
-      `
-      DELETE FROM appointment_extras
-      WHERE appointment_id IN (SELECT id FROM appointments WHERE shop_id = $1)
-      `,
-      [id]
-    );
-
-    await client.query(
-      `
-      DELETE FROM appointment_status_history
-      WHERE appointment_id IN (SELECT id FROM appointments WHERE shop_id = $1)
-      `,
-      [id]
-    );
-
-    await client.query(
-      `
-      DELETE FROM conversations
-      WHERE appointment_id IN (SELECT id FROM appointments WHERE shop_id = $1)
-      `,
-      [id]
-    );
-
-    await client.query('DELETE FROM appointments WHERE shop_id = $1', [id]);
-
-    await client.query('DELETE FROM services WHERE shop_id = $1', [id]);
-    await client.query('DELETE FROM products WHERE shop_id = $1', [id]);
-    await client.query('DELETE FROM reviews WHERE shop_id = $1', [id]);
-
-    // Eliminar la barbería
-    await client.query('DELETE FROM barber_shops WHERE id = $1', [id]);
     
     await client.query('COMMIT');
     

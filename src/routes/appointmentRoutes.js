@@ -1,4 +1,5 @@
 import express from 'express';
+import { authenticateToken } from '../middleware/auth.js';
 import {
   getAllAppointments,
   getAppointmentsByClient,
@@ -28,29 +29,29 @@ router.get('/client/:clientId', getAppointmentsByClient);
 router.get('/barber/:barberId', getAppointmentsByBarber);
 router.get('/shop/:shopId', getAppointmentsByShop);
 router.get('/:id', getAppointmentById);
-router.post('/', createAppointment);
-router.put('/:id', updateAppointment);
-router.put('/:id/cancel', cancelAppointment);
-router.put('/:id/complete', completeAppointment);
-router.put('/:id/payment', updateAppointmentPayment);
-router.put('/:id/notes', updateAppointmentBarberNotes);
-router.put('/:id/no-show', markNoShowAppointment);
-router.post('/:id/propose-advance', proposeAdvanceAppointment);
+router.post('/', authenticateToken, createAppointment);
+router.put('/:id', authenticateToken, updateAppointment);
+router.put('/:id/cancel', authenticateToken, cancelAppointment);
+router.put('/:id/complete', authenticateToken, completeAppointment);
+router.put('/:id/payment', authenticateToken, updateAppointmentPayment);
+router.put('/:id/notes', authenticateToken, updateAppointmentBarberNotes);
+router.put('/:id/no-show', authenticateToken, markNoShowAppointment);
+router.post('/:id/propose-advance', authenticateToken, proposeAdvanceAppointment);
 
 // Día libre de barbero
-router.post('/day-off', createBarberDayOff);
+router.post('/day-off', authenticateToken, createBarberDayOff);
 
 // Salida temprana de barbero
-router.post('/leave-early', createBarberLeaveEarly);
+router.post('/leave-early', authenticateToken, createBarberLeaveEarly);
 
 // Eliminar historial de citas de un cliente
 // Coincide con frontend: appointmentApi.deleteHistory -> /appointments/history/:clientId
-router.delete('/history/:clientId', deleteAppointmentsByClientAndStatus);
+router.delete('/history/:clientId', authenticateToken, deleteAppointmentsByClientAndStatus);
 
 // Eliminar historial (permanente) de un barbero (solo días anteriores)
-router.delete('/history/barber/:barberId', deleteBarberAppointmentsHistory);
+router.delete('/history/barber/:barberId', authenticateToken, deleteBarberAppointmentsHistory);
 
 // Eliminar una cita específica por id (solo admin/owner; usado para "citas fantasma")
-router.delete('/:id', deleteAppointmentById);
+router.delete('/:id', authenticateToken, deleteAppointmentById);
 
 export default router;

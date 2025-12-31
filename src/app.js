@@ -16,6 +16,8 @@ import barberBreaksRoutes from './routes/barberBreaksRoutes.js';
 import timeRoutes from './routes/timeRoutes.js';
 import chatRoutes from './routes/chatRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
+import subscriptionRoutes from './routes/subscriptionRoutes.js';
+import locationRoutes from './routes/locationRoutes.js';
 
 const app = express();
 
@@ -27,7 +29,7 @@ app.use(cors());
 // Aumentar límite de tamaño del JSON para permitir imágenes/base64 más grandes
 app.use(express.json({ limit: '10mb' }));
 
- app.use('/uploads', express.static(path.join(__dirname, '../../uploads')));
+app.use('/uploads', express.static(path.join(__dirname, '../../uploads')));
 
 // Rutas API
 app.use('/api/auth', authRoutes); // registro y login
@@ -44,6 +46,8 @@ app.use('/api/barber-breaks', barberBreaksRoutes);
 app.use('/api/time', timeRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/subscriptions', subscriptionRoutes);
+app.use('/api/location', locationRoutes);
 
 // Ruta de prueba
 app.get('/api/test', (req, res) => {

@@ -1,5 +1,6 @@
 import pool from '../db/connection.js';
 import { v4 as uuidv4 } from 'uuid';
+import { enforceShopSubscriptionForBooking } from '../services/subscriptionService.js';
 
 // Obtener todos los productos
 export const getAllProducts = async (req, res) => {
@@ -140,6 +141,20 @@ export const createProduct = async (req, res) => {
 
     // shop_id puede ser NULL (producto sin barbería asociada) o un id válido
 
+    let shopToCheck = finalShopId;
+    if (shopToCheck == null && finalBarberId != null) {
+      const barberShopRes = await client.query('SELECT shop_id FROM users WHERE id = $1', [finalBarberId]);
+      shopToCheck = barberShopRes.rows[0]?.shop_id ?? null;
+    }
+    if (shopToCheck != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, shopToCheck);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
     const uuid = uuidv4();
 
     const result = await client.query(
@@ -246,6 +261,27 @@ export const updateProduct = async (req, res) => {
 
     const existing = checkResult.rows[0];
 
+    let shopToCheck = finalShopId;
+    if (shopToCheck == null) {
+      shopToCheck = existing?.shop_id ?? null;
+    }
+    if (shopToCheck == null) {
+      const barberToUse = finalBarberId != null ? finalBarberId : (existing?.barber_id ?? null);
+      if (barberToUse != null) {
+        const barberShopRes = await client.query('SELECT shop_id FROM users WHERE id = $1', [barberToUse]);
+        shopToCheck = barberShopRes.rows[0]?.shop_id ?? null;
+      }
+    }
+
+    if (shopToCheck != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, shopToCheck);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
     // Actualizar el producto
     const result = await client.query(
       `UPDATE products 
@@ -302,6 +338,21 @@ export const deleteProduct = async (req, res) => {
       return res.status(404).json({ message: 'Producto no encontrado' });
     }
     
+    const existing = checkResult.rows[0];
+    let shopToCheck = existing?.shop_id ?? null;
+    if (shopToCheck == null && existing?.barber_id != null) {
+      const barberShopRes = await client.query('SELECT shop_id FROM users WHERE id = $1', [existing.barber_id]);
+      shopToCheck = barberShopRes.rows[0]?.shop_id ?? null;
+    }
+    if (shopToCheck != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, shopToCheck);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
     // Eliminar el producto
     await client.query('DELETE FROM products WHERE id = $1', [id]);
     

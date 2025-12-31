@@ -8,7 +8,9 @@
     "dev": "nodemon --delay 500ms --signal SIGTERM --watch src --ext js,json --ignore ../frontend --ignore ../android --ignore ../uploads src/server.js",
     "start": "node src/server.js",
     "seed": "node src/db/seed.js",
-    "init-db": "node src/db/init-db.js"
+    "init-db": "node src/db/init-db.js",
+    "cleanup:prelaunch": "node src/scripts/prelaunchCleanup.js",
+    "cleanup:prelaunch:apply": "node src/scripts/prelaunchCleanup.js --apply"
   },
   "keywords": [
     "booking",

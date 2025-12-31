@@ -1,5 +1,6 @@
 import pool from '../db/connection.js';
 import { v4 as uuidv4 } from 'uuid';
+import { enforceShopSubscriptionForBooking } from '../services/subscriptionService.js';
 
 // Obtener todos los servicios
 export const getAllServices = async (req, res) => {
@@ -127,6 +128,15 @@ export const createService = async (req, res) => {
       return res.status(400).json({ message: 'La duración del servicio es obligatoria y debe ser numérica positiva' });
     }
 
+    if (finalShopId != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, finalShopId);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
     const uuid = uuidv4();
 
     const result = await client.query(
@@ -198,6 +208,17 @@ export const updateService = async (req, res) => {
       return res.status(404).json({ message: 'Servicio no encontrado' });
     }
 
+    const existing = checkResult.rows[0];
+    const shopToCheck = finalShopId != null ? finalShopId : existing?.shop_id;
+    if (shopToCheck != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, shopToCheck);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
     if (!finalName || finalName.trim() === '') {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'El nombre del servicio es obligatorio' });
@@ -260,6 +281,17 @@ export const deleteService = async (req, res) => {
     if (checkResult.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Servicio no encontrado' });
+    }
+
+    const existing = checkResult.rows[0];
+    const shopToCheck = existing?.shop_id;
+    if (shopToCheck != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, shopToCheck);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
     }
 
     // Verificar si hay citas asociadas a este servicio

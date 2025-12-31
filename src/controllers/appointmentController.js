@@ -1,9 +1,67 @@
 import pool from '../db/connection.js';
 import { getOrCreateClientBarberConversation } from './chatController.js';
+import { enforceShopSubscriptionForBooking } from '../services/subscriptionService.js';
 
 const normalizeRole = (role) => String(role || '').toLowerCase();
 
 const DEFAULT_TIMEZONE_OFFSET = process.env.APP_TZ_OFFSET || '-04:00';
+
+const isTransientConnectionError = (error) => {
+  const msg = String(error?.message || '');
+  const code = String(error?.code || '');
+  return (
+    msg.includes('Connection terminated unexpectedly') ||
+    msg.includes('Connection terminated due to connection timeout') ||
+    msg.includes('terminating connection') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('Query read timeout') ||
+    msg.includes('timeout') ||
+    code === '57P01' ||
+    code === '57P02' ||
+    code === '57P03'
+  );
+};
+
+const queryWithRetry = async (text, params, queryTimeoutMs) => {
+  const delaysMs = [0, 250, 1000];
+  let lastError;
+
+  for (const delay of delaysMs) {
+    if (delay > 0) {
+      await new Promise((r) => setTimeout(r, delay));
+    }
+
+    let client;
+    try {
+      client = await Promise.race([
+        pool.connect(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('connect_timeout')), 7000)),
+      ]);
+    } catch (error) {
+      lastError = error;
+      if (!isTransientConnectionError(error)) throw error;
+      continue;
+    }
+
+    try {
+      return await client.query({
+        text,
+        values: params,
+        ...(queryTimeoutMs != null ? { query_timeout: queryTimeoutMs } : {}),
+      });
+    } catch (error) {
+      lastError = error;
+      if (!isTransientConnectionError(error)) throw error;
+    } finally {
+      try {
+        client.release();
+      } catch {
+      }
+    }
+  }
+
+  throw lastError;
+};
 
 const normalizeAppointmentDateInput = (input) => {
   if (input instanceof Date) {
@@ -88,7 +146,15 @@ const canUserDeleteBarberHistory = async ({ requesterId, requesterRole, barberId
 // Obtener todas las citas
 export const getAllAppointments = async (req, res) => {
   try {
-    const result = await pool.query(`
+    const includeOrphans = String(req.query?.includeOrphans ?? req.query?.include_orphans ?? '').toLowerCase() === 'true';
+    const includeArchived = String(req.query?.includeArchived ?? req.query?.include_archived ?? '').toLowerCase() === 'true';
+
+    const where = [];
+    if (!includeOrphans) where.push('bs.id IS NOT NULL AND o.id IS NOT NULL');
+    if (!includeArchived) where.push('bs.deleted_at IS NULL AND o.deleted_at IS NULL');
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const result = await queryWithRetry(`
       SELECT 
         a.id,
         a.uuid,
@@ -116,12 +182,17 @@ export const getAllAppointments = async (req, res) => {
       LEFT JOIN users b ON a.barber_id = b.id
       LEFT JOIN services s ON a.service_id = s.id
       LEFT JOIN barber_shops bs ON a.shop_id = bs.id
+      LEFT JOIN users o ON bs.owner_id = o.id
+      ${whereSql}
       ORDER BY a.date DESC
-    `);
+    `, [], 5000);
     
     res.json(result.rows);
   } catch (error) {
     console.error('Error al obtener citas:', error);
+    if (isTransientConnectionError(error)) {
+      return res.json([]);
+    }
     res.status(500).json({ message: 'Error del servidor al obtener citas' });
   }
 };
@@ -132,7 +203,10 @@ export const updateAppointmentBarberNotes = async (req, res) => {
     await client.query('BEGIN');
 
     const { id } = req.params;
-    const { notes, notesBarber, notes_barber, requesterId, requesterRole } = req.body || {};
+    const { notes, notesBarber, notes_barber } = req.body || {};
+
+    const requesterId = req.user?.userId ?? req.body?.requesterId;
+    const requesterRole = req.user?.role ?? req.body?.requesterRole;
 
     const finalNotes =
       notes !== undefined
@@ -152,6 +226,16 @@ export const updateAppointmentBarberNotes = async (req, res) => {
     }
 
     const appt = apptRes.rows[0];
+
+    if (appt?.shop_id != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, appt.shop_id);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
     const role = String(requesterRole || '').toLowerCase();
     const rid = requesterId != null ? String(requesterId) : null;
 
@@ -232,6 +316,13 @@ export const createBarberLeaveEarly = async (req, res) => {
       return res.status(400).json({ message: 'Fecha/hora inválida para salida temprana' });
     }
 
+    try {
+      await enforceShopSubscriptionForBooking(client, finalShopId);
+    } catch (e) {
+      await client.query('ROLLBACK');
+      return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+    }
+
     await client.query(
       `UPDATE appointments
        SET status = 'cancelled', updated_at = NOW()
@@ -279,7 +370,10 @@ export const deleteBarberAppointmentsHistory = async (req, res) => {
   const client = await pool.connect();
   try {
     const { barberId } = req.params;
-    const { mode, requesterId, requesterRole } = req.body || {};
+    const { mode } = req.body || {};
+
+    const requesterId = req.user?.userId ?? req.body?.requesterId;
+    const requesterRole = req.user?.role ?? req.body?.requesterRole;
 
     if (!barberId) {
       return res.status(400).json({ message: 'barberId es requerido' });
@@ -333,6 +427,25 @@ export const deleteBarberAppointmentsHistory = async (req, res) => {
       return res.json({ deleted: 0 });
     }
 
+    const shopRes = await client.query(
+      `SELECT DISTINCT shop_id
+       FROM appointments
+       WHERE id = ANY($1::int[])
+         AND shop_id IS NOT NULL`,
+      [appointmentIds]
+    );
+    for (const row of shopRes.rows) {
+      const shopId = row?.shop_id;
+      if (shopId != null) {
+        try {
+          await enforceShopSubscriptionForBooking(client, shopId);
+        } catch (e) {
+          await client.query('ROLLBACK');
+          return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+        }
+      }
+    }
+
     // 2) Borrar dependencias antes de borrar appointments
     // appointment_notes
     await client.query('DELETE FROM appointment_notes WHERE appointment_id = ANY($1::int[])', [appointmentIds]);
@@ -374,7 +487,8 @@ export const deleteAppointmentById = async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
-    const { requesterId, requesterRole } = req.body || {};
+    const requesterId = req.user?.userId ?? req.body?.requesterId;
+    const requesterRole = req.user?.role ?? req.body?.requesterRole;
 
     if (!id) {
       return res.status(400).json({ message: 'id es requerido' });
@@ -387,10 +501,20 @@ export const deleteAppointmentById = async (req, res) => {
 
     await client.query('BEGIN');
 
-    const apptRes = await client.query('SELECT id FROM appointments WHERE id = $1', [id]);
+    const apptRes = await client.query('SELECT id, shop_id FROM appointments WHERE id = $1', [id]);
     if (apptRes.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Cita no encontrada' });
+    }
+
+    const shopToCheck = apptRes.rows[0]?.shop_id ?? null;
+    if (shopToCheck != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, shopToCheck);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
     }
 
     const appointmentId = Number(id);
@@ -591,6 +715,13 @@ export const createAppointment = async (req, res) => {
     if (!finalDate || !normalizedDate || !finalClientId || !finalBarberId || !finalShopId || !finalServiceId) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Datos incompletos para crear la cita' });
+    }
+
+    try {
+      await enforceShopSubscriptionForBooking(client, finalShopId);
+    } catch (e) {
+      await client.query('ROLLBACK');
+      return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
     }
 
     if (finalStatus === 'confirmed') {
@@ -914,6 +1045,13 @@ export const createBarberDayOff = async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Faltan datos para marcar el día libre (date, barberId, shopId)' });
     }
+
+    try {
+      await enforceShopSubscriptionForBooking(client, finalShopId);
+    } catch (e) {
+      await client.query('ROLLBACK');
+      return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+    }
     
     // Normalizar fecha: si viene solo YYYY-MM-DD, agregar T00:00:00
     const normalizedDate = normalizeAppointmentDateInput(date);
@@ -975,6 +1113,17 @@ export const updateAppointment = async (req, res) => {
     if (checkResult.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Cita no encontrada' });
+    }
+
+    const existing = checkResult.rows[0];
+    const shopToCheck = shop_id != null ? shop_id : (existing?.shop_id ?? null);
+    if (shopToCheck != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, shopToCheck);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
     }
     
     // Si se cambia la fecha/hora/barbero, verificar disponibilidad
@@ -1062,7 +1211,7 @@ export const cancelAppointment = async (req, res) => {
 
     // Verificar que la cita existe
     const checkResult = await client.query(
-      'SELECT id, date, status FROM appointments WHERE id = $1',
+      'SELECT id, date, status, shop_id FROM appointments WHERE id = $1',
       [id]
     );
 
@@ -1072,6 +1221,16 @@ export const cancelAppointment = async (req, res) => {
     }
 
     const appt = checkResult.rows[0];
+
+    if (appt?.shop_id != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, appt.shop_id);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
     const status = String(appt.status || '').toLowerCase();
     const startMs = appt.date ? new Date(appt.date).getTime() : NaN;
     const isPast = Number.isNaN(startMs) ? false : startMs < Date.now();
@@ -1123,6 +1282,16 @@ export const completeAppointment = async (req, res) => {
       return res.status(404).json({ message: 'Cita no encontrada' });
     }
 
+    const shopToCheck = checkResult.rows[0]?.shop_id ?? null;
+    if (shopToCheck != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, shopToCheck);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
     const result = await client.query(
       `UPDATE appointments 
        SET status = 'completed',
@@ -1156,9 +1325,10 @@ export const updateAppointmentPayment = async (req, res) => {
       payment_method,
       paymentStatus,
       payment_status,
-      requesterId,
-      requesterRole,
     } = req.body || {};
+
+    const requesterId = req.user?.userId ?? req.body?.requesterId;
+    const requesterRole = req.user?.role ?? req.body?.requesterRole;
 
     const finalPaymentMethod = paymentMethod !== undefined ? paymentMethod : payment_method;
     const finalPaymentStatus = paymentStatus !== undefined ? paymentStatus : payment_status;
@@ -1191,6 +1361,16 @@ export const updateAppointmentPayment = async (req, res) => {
     }
 
     const appt = apptRes.rows[0];
+
+    if (appt?.shop_id != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, appt.shop_id);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
+
     const role = String(requesterRole || '').toLowerCase();
     const rid = requesterId != null ? String(requesterId) : null;
 
@@ -1254,6 +1434,16 @@ export const markNoShowAppointment = async (req, res) => {
     if (checkResult.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Cita no encontrada' });
+    }
+
+    const shopToCheck = checkResult.rows[0]?.shop_id ?? null;
+    if (shopToCheck != null) {
+      try {
+        await enforceShopSubscriptionForBooking(client, shopToCheck);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
     }
 
     const result = await client.query(
