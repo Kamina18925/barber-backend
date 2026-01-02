@@ -31,6 +31,20 @@ const getPaypalPlanIdForCode = (planCode) => {
   return planId || null;
 };
 
+const getPlanCodeForPaypalPlanId = (paypalPlanId) => {
+  const pid = String(paypalPlanId || '').trim();
+  if (!pid) return null;
+
+  const reverse = {
+    [String(process.env.PAYPAL_PLAN_ID_BASIC_1 || '').trim()]: 'basic_1',
+    [String(process.env.PAYPAL_PLAN_ID_BASIC_2 || '').trim()]: 'basic_2',
+    [String(process.env.PAYPAL_PLAN_ID_PRO || '').trim()]: 'pro',
+    [String(process.env.PAYPAL_PLAN_ID_PREMIUM || '').trim()]: 'premium',
+  };
+
+  return reverse[pid] || null;
+};
+
 const getPublicAppUrl = (req) => {
   const fromEnv = String(process.env.FRONTEND_PUBLIC_URL || process.env.APP_PUBLIC_URL || '').trim();
   if (fromEnv) return fromEnv;
@@ -264,6 +278,8 @@ export const paypalConfirmSubscription = async (req, res) => {
       return res.status(502).json({ message: 'Respuesta inválida de PayPal', raw: ppData });
     }
 
+    const planCodeFromPaypal = getPlanCodeForPaypalPlanId(ppData?.plan_id);
+
     await client.query('BEGIN');
     const sub = await getOrCreateOwnerSubscription(client, ownerId);
     if (String(sub.paypal_subscription_id || '') !== String(subscriptionId)) {
@@ -271,7 +287,7 @@ export const paypalConfirmSubscription = async (req, res) => {
       return res.status(400).json({ message: 'subscriptionId no coincide con el owner' });
     }
 
-    const pendingPlan = sub.pending_plan_code || sub.plan_code || null;
+    const pendingPlan = sub.pending_plan_code || planCodeFromPaypal || sub.plan_code || null;
     const nextBillingIso = ppData?.billing_info?.next_billing_time || null;
     const now = new Date();
     const nextBilling = nextBillingIso ? new Date(nextBillingIso) : null;
@@ -428,6 +444,34 @@ export const paypalWebhook = async (req, res) => {
         !eventType.includes('REFUNDED'));
 
     if (isPaymentSuccessEvent && transactionId) {
+      // Sync internal plan_code from PayPal subscription (source of truth)
+      try {
+        const accessToken = await getPaypalAccessToken();
+        const baseUrl = getPaypalBaseUrl();
+        const ppRes = await fetch(`${baseUrl}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+        });
+        const ppData = await ppRes.json().catch(() => null);
+        if (ppRes.ok) {
+          const planCodeFromPaypal = getPlanCodeForPaypalPlanId(ppData?.plan_id);
+          if (planCodeFromPaypal) {
+            await client.query(
+              `UPDATE subscriptions
+               SET plan_code = COALESCE($2, plan_code),
+                   updated_at = NOW()
+               WHERE owner_id = $1`,
+              [ownerId, planCodeFromPaypal]
+            );
+          }
+        }
+      } catch (e) {
+        // best-effort sync
+      }
+
       const exists = await client.query(
         `SELECT 1 FROM payments WHERE provider = 'paypal_subscription' AND provider_payment_id = $1 LIMIT 1`,
         [String(transactionId)]
@@ -525,7 +569,7 @@ const renewSubscription30Days = async (client, ownerId) => {
 
   const usage = await computeOwnerUsageCounts(client, ownerId);
   const pricing = computeMonthlyPriceDop(usage);
-  const planCode = pricing?.tier?.code || null;
+  const planCode = sub?.pending_plan_code || sub?.plan_code || pricing?.tier?.code || null;
 
   const now = new Date();
   const currentEnd = sub?.current_period_end ? new Date(sub.current_period_end) : null;
