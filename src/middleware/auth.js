@@ -27,7 +27,8 @@ export const authorizeRoles = (...roles) => {
 
     const role = String(req.user.role || '').toLowerCase();
     const allowed = roles.map(r => String(r || '').toLowerCase());
-    if (!allowed.includes(role)) {
+    const ok = allowed.some((r) => role.includes(r));
+    if (!ok) {
       return res.status(403).json({ message: 'Access denied. Insufficient permissions.' });
     }
     

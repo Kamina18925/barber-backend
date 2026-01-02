@@ -15,12 +15,478 @@ const canAccessOwner = (req, ownerId) => {
   return uid != null && String(uid) === String(ownerId);
 };
 
+const VALID_PLAN_CODES = new Set(['basic_1', 'basic_2', 'pro', 'premium']);
+
+const getPaypalPlanIdForCode = (planCode) => {
+  const code = String(planCode || '').trim();
+  if (!VALID_PLAN_CODES.has(code)) return null;
+
+  const envMap = {
+    basic_1: process.env.PAYPAL_PLAN_ID_BASIC_1,
+    basic_2: process.env.PAYPAL_PLAN_ID_BASIC_2,
+    pro: process.env.PAYPAL_PLAN_ID_PRO,
+    premium: process.env.PAYPAL_PLAN_ID_PREMIUM,
+  };
+  const planId = String(envMap[code] || '').trim();
+  return planId || null;
+};
+
+const getPublicAppUrl = (req) => {
+  const fromEnv = String(process.env.FRONTEND_PUBLIC_URL || process.env.APP_PUBLIC_URL || '').trim();
+  if (fromEnv) return fromEnv;
+
+  const origin = String(req.headers?.origin || '').trim();
+  if (origin) return origin;
+
+  const referer = String(req.headers?.referer || '').trim();
+  if (referer) {
+    try {
+      const u = new URL(referer);
+      return u.origin;
+    } catch {
+      // ignore
+    }
+  }
+
+  return 'http://localhost:5173';
+};
+
+const verifyPaypalWebhookSignature = async ({ headers, event }) => {
+  const webhookId = String(process.env.PAYPAL_WEBHOOK_ID || '').trim();
+  if (!webhookId) {
+    const err = new Error('Falta PAYPAL_WEBHOOK_ID para verificar webhooks de PayPal');
+    err.status = 500;
+    throw err;
+  }
+
+  const transmissionId = headers['paypal-transmission-id'];
+  const transmissionTime = headers['paypal-transmission-time'];
+  const transmissionSig = headers['paypal-transmission-sig'];
+  const certUrl = headers['paypal-cert-url'];
+  const authAlgo = headers['paypal-auth-algo'];
+
+  if (!transmissionId || !transmissionTime || !transmissionSig || !certUrl || !authAlgo) {
+    const err = new Error('Headers de webhook PayPal incompletos');
+    err.status = 400;
+    throw err;
+  }
+
+  const accessToken = await getPaypalAccessToken();
+  const baseUrl = getPaypalBaseUrl();
+
+  const payload = {
+    transmission_id: transmissionId,
+    transmission_time: transmissionTime,
+    cert_url: certUrl,
+    auth_algo: authAlgo,
+    transmission_sig: transmissionSig,
+    webhook_id: webhookId,
+    webhook_event: event,
+  };
+
+  const res = await fetch(`${baseUrl}/v1/notifications/verify-webhook-signature`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const err = new Error(data?.message || 'No se pudo verificar firma de webhook PayPal');
+    err.status = 502;
+    err.details = data;
+    throw err;
+  }
+
+  return String(data?.verification_status || '').toUpperCase() === 'SUCCESS';
+};
+
 const requireAdmin = (req) => {
   const role = normalizeRole(req.user?.role);
   if (!role.includes('admin')) {
     const err = new Error('Acceso denegado: solo admin');
     err.status = 403;
     throw err;
+  }
+};
+
+export const paypalCreateSubscription = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ownerId = req.user?.userId;
+    if (!ownerId) return res.status(401).json({ message: 'Authentication required' });
+
+    const role = normalizeRole(req.user?.role);
+    if (!role.includes('admin') && !role.includes('owner')) {
+      return res.status(403).json({ message: 'Acceso denegado' });
+    }
+
+    const { planCode } = req.body || {};
+    const code = String(planCode || '').trim();
+    if (!VALID_PLAN_CODES.has(code)) {
+      return res.status(400).json({ message: 'planCode inválido' });
+    }
+
+    const planId = getPaypalPlanIdForCode(code);
+    if (!planId) {
+      return res.status(500).json({ message: `Falta configurar PAYPAL_PLAN_ID_* para planCode=${code}` });
+    }
+
+    const usage = await computeOwnerUsageCounts(client, ownerId);
+    const pricing = computeMonthlyPriceDop(usage);
+    if (pricing?.isOverLimit) {
+      return res.status(400).json({
+        message: 'Tu cuenta excede los límites del plan. Ajusta negocios/profesionales o contacta al administrador.',
+        pricing,
+        usage,
+      });
+    }
+
+    const tierLimits = pricing?.tier?.limits || null;
+    if (tierLimits && (Number(usage?.shopCount || 0) > Number(tierLimits.shops) || Number(usage?.professionalCount || 0) > Number(tierLimits.professionals))) {
+      return res.status(400).json({
+        message: 'Tu uso actual excede el plan seleccionado. Elige un plan superior.',
+        pricing,
+        usage,
+      });
+    }
+
+    const appUrl = getPublicAppUrl(req);
+    const returnUrl = `${appUrl}/?paypal_subscription_success=1`;
+    const cancelUrl = `${appUrl}/?paypal_subscription_cancel=1`;
+
+    const accessToken = await getPaypalAccessToken();
+    const baseUrl = getPaypalBaseUrl();
+
+    const payload = {
+      plan_id: planId,
+      custom_id: `owner_${ownerId}_plan_${code}`,
+      application_context: {
+        brand_name: 'Stylex',
+        locale: 'es-DO',
+        shipping_preference: 'NO_SHIPPING',
+        user_action: 'SUBSCRIBE_NOW',
+        return_url: returnUrl,
+        cancel_url: cancelUrl,
+      },
+    };
+
+    const ppRes = await fetch(`${baseUrl}/v1/billing/subscriptions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const ppData = await ppRes.json().catch(() => null);
+    if (!ppRes.ok) {
+      const err = new Error(ppData?.message || 'Error creando suscripción de PayPal');
+      err.status = 502;
+      err.details = ppData;
+      throw err;
+    }
+
+    const paypalSubscriptionId = ppData?.id || null;
+    const approveLink = Array.isArray(ppData?.links)
+      ? ppData.links.find((l) => String(l?.rel || '').toLowerCase() === 'approve')
+      : null;
+    const approvalUrl = approveLink?.href || null;
+
+    if (!paypalSubscriptionId || !approvalUrl) {
+      return res.status(502).json({ message: 'Respuesta inválida de PayPal creando suscripción', raw: ppData });
+    }
+
+    await client.query('BEGIN');
+    await getOrCreateOwnerSubscription(client, ownerId);
+    await client.query(
+      `UPDATE subscriptions
+       SET billing_provider = 'paypal',
+           paypal_subscription_id = $2,
+           paypal_subscription_status = $3,
+           pending_plan_code = $4,
+           pending_plan_effective_at = NULL,
+           updated_at = NOW()
+       WHERE owner_id = $1`,
+      [ownerId, paypalSubscriptionId, String(ppData?.status || ''), code]
+    );
+    await client.query('COMMIT');
+
+    return res.json({ id: paypalSubscriptionId, approvalUrl, raw: ppData });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error paypalCreateSubscription:', error);
+    return res.status(error.status || 500).json({ message: error.message || 'Error del servidor' });
+  } finally {
+    client.release();
+  }
+};
+
+export const paypalConfirmSubscription = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ownerId = req.user?.userId;
+    if (!ownerId) return res.status(401).json({ message: 'Authentication required' });
+
+    const role = normalizeRole(req.user?.role);
+    if (!role.includes('admin') && !role.includes('owner')) {
+      return res.status(403).json({ message: 'Acceso denegado' });
+    }
+
+    const { subscriptionId } = req.body || {};
+    if (!subscriptionId) return res.status(400).json({ message: 'subscriptionId requerido' });
+
+    const accessToken = await getPaypalAccessToken();
+    const baseUrl = getPaypalBaseUrl();
+
+    const ppRes = await fetch(`${baseUrl}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    const ppData = await ppRes.json().catch(() => null);
+    if (!ppRes.ok) {
+      const err = new Error(ppData?.message || 'Error consultando suscripción de PayPal');
+      err.status = 502;
+      err.details = ppData;
+      throw err;
+    }
+
+    const status = String(ppData?.status || '').toUpperCase();
+    if (!status) {
+      return res.status(502).json({ message: 'Respuesta inválida de PayPal', raw: ppData });
+    }
+
+    await client.query('BEGIN');
+    const sub = await getOrCreateOwnerSubscription(client, ownerId);
+    if (String(sub.paypal_subscription_id || '') !== String(subscriptionId)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'subscriptionId no coincide con el owner' });
+    }
+
+    const pendingPlan = sub.pending_plan_code || sub.plan_code || null;
+    const nextBillingIso = ppData?.billing_info?.next_billing_time || null;
+    const now = new Date();
+    const nextBilling = nextBillingIso ? new Date(nextBillingIso) : null;
+    const periodEnd = nextBilling && !Number.isNaN(nextBilling.getTime()) ? nextBilling : new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const graceEnd = new Date(periodEnd.getTime() + 5 * 24 * 60 * 60 * 1000);
+
+    await client.query(
+      `UPDATE subscriptions
+       SET status = $2,
+           plan_code = COALESCE($3, plan_code),
+           billing_provider = 'paypal',
+           paypal_subscription_status = $4,
+           pending_plan_code = NULL,
+           pending_plan_effective_at = NULL,
+           current_period_start = $5,
+           current_period_end = $6,
+           grace_period_end = $7,
+           updated_at = NOW()
+       WHERE owner_id = $1
+       RETURNING *`,
+      [
+        ownerId,
+        status === 'ACTIVE' ? 'active' : 'inactive',
+        pendingPlan,
+        status,
+        now.toISOString(),
+        periodEnd.toISOString(),
+        graceEnd.toISOString(),
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({ success: true, paypal: ppData });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error paypalConfirmSubscription:', error);
+    return res.status(error.status || 500).json({ message: error.message || 'Error del servidor' });
+  } finally {
+    client.release();
+  }
+};
+
+export const paypalCancelSubscription = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ownerId = req.user?.userId;
+    if (!ownerId) return res.status(401).json({ message: 'Authentication required' });
+
+    const role = normalizeRole(req.user?.role);
+    if (!role.includes('admin') && !role.includes('owner')) {
+      return res.status(403).json({ message: 'Acceso denegado' });
+    }
+
+    const sub = await getOrCreateOwnerSubscription(client, ownerId);
+    const subscriptionId = sub.paypal_subscription_id;
+    if (!subscriptionId) return res.status(400).json({ message: 'No hay suscripción PayPal activa' });
+
+    const accessToken = await getPaypalAccessToken();
+    const baseUrl = getPaypalBaseUrl();
+
+    const ppRes = await fetch(`${baseUrl}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}/cancel`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ reason: 'Cancelado por el usuario' }),
+    });
+
+    if (!ppRes.ok) {
+      const ppData = await ppRes.json().catch(() => null);
+      const err = new Error(ppData?.message || 'Error cancelando suscripción PayPal');
+      err.status = 502;
+      err.details = ppData;
+      throw err;
+    }
+
+    await client.query(
+      `UPDATE subscriptions
+       SET paypal_subscription_status = 'CANCELLED',
+           updated_at = NOW()
+       WHERE owner_id = $1`,
+      [ownerId]
+    );
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Error paypalCancelSubscription:', error);
+    return res.status(error.status || 500).json({ message: error.message || 'Error del servidor' });
+  } finally {
+    client.release();
+  }
+};
+
+export const paypalWebhook = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const headers = Object.fromEntries(
+      Object.entries(req.headers || {}).map(([k, v]) => [String(k || '').toLowerCase(), v])
+    );
+    const event = req.body;
+
+    const ok = await verifyPaypalWebhookSignature({ headers, event });
+    if (!ok) {
+      return res.status(400).json({ message: 'Firma de webhook inválida' });
+    }
+
+    const eventType = String(event?.event_type || '').toUpperCase();
+    const resource = event?.resource || {};
+
+    const subscriptionId = resource?.billing_agreement_id || resource?.id || resource?.subscription_id || null;
+    const transactionId = resource?.id || resource?.sale_id || resource?.transaction_id || null;
+
+    if (!subscriptionId) {
+      return res.json({ received: true });
+    }
+
+    await client.query('BEGIN');
+
+    const subRes = await client.query(
+      `SELECT * FROM subscriptions WHERE paypal_subscription_id = $1 LIMIT 1 FOR UPDATE`,
+      [subscriptionId]
+    );
+
+    if (subRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.json({ received: true });
+    }
+
+    const subRow = subRes.rows[0];
+    const ownerId = subRow.owner_id;
+
+    if (eventType.startsWith('BILLING.SUBSCRIPTION.')) {
+      const newStatus = String(resource?.status || '').toUpperCase() || eventType;
+      await client.query(
+        `UPDATE subscriptions
+         SET paypal_subscription_status = $2,
+             billing_provider = 'paypal',
+             updated_at = NOW()
+         WHERE owner_id = $1`,
+        [ownerId, newStatus]
+      );
+    }
+
+    const isPaymentSuccessEvent =
+      eventType === 'BILLING.SUBSCRIPTION.PAYMENT.SUCCEEDED' ||
+      eventType === 'PAYMENT.CAPTURE.COMPLETED' ||
+      eventType === 'PAYMENT.SALE.COMPLETED' ||
+      (eventType.includes('PAYMENT') &&
+        !eventType.includes('FAILED') &&
+        !eventType.includes('DENIED') &&
+        !eventType.includes('REVERSED') &&
+        !eventType.includes('REFUNDED'));
+
+    if (isPaymentSuccessEvent && transactionId) {
+      const exists = await client.query(
+        `SELECT 1 FROM payments WHERE provider = 'paypal_subscription' AND provider_payment_id = $1 LIMIT 1`,
+        [String(transactionId)]
+      );
+
+      if (exists.rows.length === 0) {
+        const renewed = await renewSubscription30Days(client, ownerId);
+
+        const amount = resource?.amount?.total || resource?.amount?.value || resource?.amount?.amount || null;
+        const currency = resource?.amount?.currency || resource?.amount?.currency_code || resource?.amount?.currencyCode || null;
+        const paidAt = resource?.time || resource?.create_time || null;
+
+        await client.query(
+          `INSERT INTO payments (
+            owner_id,
+            provider,
+            status,
+            amount,
+            currency,
+            provider_payment_id,
+            metadata,
+            paid_at,
+            created_at,
+            updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
+          [
+            ownerId,
+            'paypal_subscription',
+            'confirmed',
+            amount != null ? Number(amount) : null,
+            currency ? String(currency).toUpperCase() : null,
+            String(transactionId),
+            { eventType, subscriptionId, raw: event },
+            paidAt ? new Date(paidAt).toISOString() : new Date().toISOString(),
+          ]
+        );
+
+        await client.query(
+          `UPDATE subscriptions
+           SET status = 'active',
+               billing_provider = 'paypal',
+               updated_at = NOW()
+           WHERE owner_id = $1`,
+          [ownerId]
+        );
+
+        await client.query('COMMIT');
+        return res.json({ received: true, renewed: Boolean(renewed) });
+      }
+    }
+
+    await client.query('COMMIT');
+    return res.json({ received: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error paypalWebhook:', error);
+    return res.status(error.status || 500).json({ message: error.message || 'Error del servidor' });
+  } finally {
+    client.release();
   }
 };
 
@@ -36,8 +502,30 @@ const clampInt = (value, { min, max, fallback }) => {
   return Math.min(max, Math.max(min, Math.trunc(n)));
 };
 
+const getTransferConfig = () => {
+  const bankName = String(process.env.TRANSFER_BANK_NAME || '').trim();
+  const accountHolder = String(process.env.TRANSFER_ACCOUNT_HOLDER || '').trim();
+  const accountNumber = String(process.env.TRANSFER_ACCOUNT_NUMBER || '').trim();
+  const accountType = String(process.env.TRANSFER_ACCOUNT_TYPE || '').trim();
+  const notes = String(process.env.TRANSFER_NOTES || '').replace(/\\n/g, '\n').trim();
+
+  const enabled = Boolean(bankName || accountHolder || accountNumber || accountType || notes);
+  return {
+    enabled,
+    bankName: bankName || null,
+    accountHolder: accountHolder || null,
+    accountNumber: accountNumber || null,
+    accountType: accountType || null,
+    notes: notes || null,
+  };
+};
+
 const renewSubscription30Days = async (client, ownerId) => {
   const sub = await getOrCreateOwnerSubscription(client, ownerId);
+
+  const usage = await computeOwnerUsageCounts(client, ownerId);
+  const pricing = computeMonthlyPriceDop(usage);
+  const planCode = pricing?.tier?.code || null;
 
   const now = new Date();
   const currentEnd = sub?.current_period_end ? new Date(sub.current_period_end) : null;
@@ -48,13 +536,14 @@ const renewSubscription30Days = async (client, ownerId) => {
   const updated = await client.query(
     `UPDATE subscriptions
      SET status = 'active',
+         plan_code = COALESCE($5, plan_code),
          current_period_start = $2,
          current_period_end = $3,
          grace_period_end = $4,
          updated_at = NOW()
      WHERE owner_id = $1
      RETURNING *`,
-    [ownerId, start.toISOString(), periodEnd.toISOString(), graceEnd.toISOString()]
+    [ownerId, start.toISOString(), periodEnd.toISOString(), graceEnd.toISOString(), planCode]
   );
 
   return updated.rows[0];
@@ -172,8 +661,19 @@ export const paypalCreateOrder = async (req, res) => {
     const usage = await computeOwnerUsageCounts(client, ownerId);
     const pricing = computeMonthlyPriceDop(usage);
 
+    if (pricing?.total == null || !Number.isFinite(Number(pricing.total)) || Number(pricing.total) <= 0) {
+      return res.status(400).json({
+        message:
+          pricing?.isOverLimit
+            ? 'Tu cuenta excede los límites del plan. Ajusta negocios/profesionales o contacta al administrador.'
+            : 'Monto inválido para crear orden',
+        pricing,
+        usage,
+      });
+    }
+
     const currency = getPaypalCurrency();
-    const amountValue = computePaypalAmountFromDop(pricing?.total || 0);
+    const amountValue = computePaypalAmountFromDop(pricing.total);
     if (Number(amountValue) <= 0) {
       return res.status(400).json({ message: 'Monto inválido para crear orden' });
     }
@@ -322,10 +822,18 @@ export const getOwnerSubscriptionSummary = async (req, res) => {
     const pricing = computeMonthlyPriceDop(usage);
     const state = computeSubscriptionState(sub);
 
+    const transfer = getTransferConfig();
+
     return res.json({
       ownerId: Number(ownerId),
       subscription: {
         status: sub.status,
+        plan_code: sub.plan_code || null,
+        billing_provider: sub.billing_provider || null,
+        paypal_subscription_id: sub.paypal_subscription_id || null,
+        paypal_subscription_status: sub.paypal_subscription_status || null,
+        pending_plan_code: sub.pending_plan_code || null,
+        pending_plan_effective_at: sub.pending_plan_effective_at || null,
         current_period_start: sub.current_period_start,
         current_period_end: sub.current_period_end,
         grace_period_end: sub.grace_period_end,
@@ -339,6 +847,7 @@ export const getOwnerSubscriptionSummary = async (req, res) => {
       },
       usage,
       pricing,
+      transfer,
     });
   } catch (error) {
     console.error('Error getOwnerSubscriptionSummary:', error);

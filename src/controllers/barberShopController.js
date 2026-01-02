@@ -1,6 +1,23 @@
 import pool from '../db/connection.js';
 import bcrypt from 'bcrypt';
 import { enforceOwnerSubscriptionForManagement } from '../services/subscriptionService.js';
+import jwt from 'jsonwebtoken';
+
+const normalizeRole = (role) => String(role || '').toLowerCase();
+
+const getAdminFromOptionalJwt = (req) => {
+  const authHeader = req.headers?.authorization;
+  const token = authHeader && String(authHeader).startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+  if (!token) return null;
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const role = normalizeRole(decoded?.role);
+    if (role.includes('admin')) return decoded;
+    return null;
+  } catch {
+    return null;
+  }
+};
 
 const normalizeCategories = (raw) => {
   const allowed = new Set(['barberia', 'salon_belleza', 'spa_estetica', 'unas', 'depilacion']);
@@ -29,8 +46,11 @@ export const getAllBarberShops = async (req, res) => {
     const includeOrphans = String(req.query?.includeOrphans ?? req.query?.include_orphans ?? '').toLowerCase() === 'true';
     const includeArchived = String(req.query?.includeArchived ?? req.query?.include_archived ?? '').toLowerCase() === 'true';
 
+    const admin = getAdminFromOptionalJwt(req);
+    const includeArchivedEffective = includeArchived && !!admin;
+
     const where = [];
-    if (!includeArchived) where.push('bs.deleted_at IS NULL');
+    if (!includeArchivedEffective) where.push('bs.deleted_at IS NULL');
     if (!includeOrphans) where.push('u.id IS NOT NULL AND u.deleted_at IS NULL');
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
@@ -41,6 +61,7 @@ export const getAllBarberShops = async (req, res) => {
         bs.name, 
         bs.address, 
         bs.schedule,
+        bs.deleted_at,
         COALESCE(bs.categories, ARRAY['barberia']::text[]) as categories,
         COALESCE(rv.avg_rating, bs.rating, 0.0) as rating,
         COALESCE(rv.review_count, 0) as review_count,
@@ -598,6 +619,8 @@ export const deleteBarberShop = async (req, res) => {
     
     const { id } = req.params;
     const force = String(req.query?.force || '').toLowerCase() === 'true';
+    const admin = getAdminFromOptionalJwt(req);
+    const hardDelete = force && !!admin;
     
     // Verificar que la barbería existe
     const checkResult = await client.query('SELECT * FROM barber_shops WHERE id = $1', [id]);
@@ -608,12 +631,26 @@ export const deleteBarberShop = async (req, res) => {
     }
 
     const existing = checkResult.rows[0];
-    if (existing?.deleted_at) {
+    if (existing?.deleted_at && !hardDelete) {
       await client.query('COMMIT');
       return res.status(204).send();
     }
 
     const ownerId = existing?.owner_id ?? null;
+
+    // Si es hard delete (admin + force=true), eliminamos físicamente la barbería.
+    // Para respetar FKs, primero desasociamos registros relacionados.
+    if (hardDelete) {
+      await client.query('UPDATE users SET shop_id = NULL WHERE shop_id = $1', [id]);
+      await client.query('UPDATE services SET shop_id = NULL WHERE shop_id = $1', [id]);
+      await client.query('UPDATE products SET shop_id = NULL WHERE shop_id = $1', [id]);
+      await client.query('UPDATE appointments SET shop_id = NULL WHERE shop_id = $1', [id]);
+      await client.query('UPDATE reviews SET shop_id = NULL WHERE shop_id = $1', [id]);
+
+      await client.query('DELETE FROM barber_shops WHERE id = $1', [id]);
+      await client.query('COMMIT');
+      return res.status(204).send();
+    }
 
     if (ownerId != null) {
       try {

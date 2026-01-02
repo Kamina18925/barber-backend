@@ -27,7 +27,18 @@ const __dirname = path.dirname(__filename);
 // Middleware
 app.use(cors());
 // Aumentar límite de tamaño del JSON para permitir imágenes/base64 más grandes
-app.use(express.json({ limit: '10mb' }));
+app.use(
+  express.json({
+    limit: '10mb',
+    verify: (req, res, buf) => {
+      try {
+        req.rawBody = buf;
+      } catch {
+        // ignore
+      }
+    },
+  })
+);
 
 app.use('/uploads', express.static(path.join(__dirname, '../../uploads')));
 

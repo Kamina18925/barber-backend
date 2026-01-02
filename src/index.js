@@ -16,16 +16,16 @@ import chatRoutes from './routes/chatRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
 import { connectDB } from './db/connection.js';
 
+// Get current file directory (ESM equivalent of __dirname)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 // Load environment variables
-dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 // Create Express app
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// Get current file directory (ESM equivalent of __dirname)
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // Middleware
 app.use(cors());

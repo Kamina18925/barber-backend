@@ -31,7 +31,7 @@ const getAdminFromOptionalJwt = (req) => {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const role = normalizeRole(decoded?.role);
-    if (role.includes('admin')) return decoded;
+    if (role.includes('admin') || role.includes('owner')) return decoded;
     return null;
   } catch {
     return null;
@@ -546,6 +546,8 @@ export const createUser = async (req, res) => {
       phone,
       role,
       rol,
+      shop_id,
+      shopId,
       whatsappLink,
       whatsapp_link,
       photoUrl,
@@ -563,10 +565,59 @@ export const createUser = async (req, res) => {
       ? whatsappLink
       : (whatsapp_link !== undefined ? whatsapp_link : null);
     const desiredRole = (rol || role || 'client').toLowerCase();
-    const allowedCreateRoles = new Set(['client', 'owner', 'barber']);
+    const requesterJwt = getAdminFromOptionalJwt(req);
+    const requesterRole = normalizeRole(requesterJwt?.role);
+
+    const allowedCreateRoles = new Set(['client', 'barber']);
     const safeDesiredRole = allowedCreateRoles.has(desiredRole) ? desiredRole : 'client';
-    const adminJwt = getAdminFromOptionalJwt(req);
-    const finalRole = adminJwt ? safeDesiredRole : 'client';
+
+    let finalRole = 'client';
+    if (requesterRole.includes('admin')) {
+      finalRole = safeDesiredRole;
+    } else if (requesterRole.includes('owner')) {
+      finalRole = safeDesiredRole === 'barber' ? 'barber' : 'client';
+    }
+
+    let finalShopId = null;
+    if (shop_id !== undefined) {
+      finalShopId = shop_id;
+    } else if (shopId !== undefined) {
+      finalShopId = shopId;
+    }
+
+    if (finalShopId !== null && finalShopId !== undefined) {
+      const parsed = Number(finalShopId);
+      if (Number.isNaN(parsed)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'shop_id inválido, debe ser numérico o null' });
+      }
+      finalShopId = parsed;
+    } else {
+      finalShopId = null;
+    }
+
+    if (requesterRole.includes('owner') && !requesterRole.includes('admin') && finalShopId != null) {
+      const ownRes = await client.query(
+        `SELECT 1
+         FROM barber_shops
+         WHERE id = $1
+           AND owner_id = $2
+           AND deleted_at IS NULL
+         LIMIT 1`,
+        [finalShopId, requesterJwt.userId]
+      );
+      if (ownRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ message: 'Acceso denegado' });
+      }
+
+      try {
+        await enforceShopSubscriptionForBooking(client, finalShopId);
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return res.status(e.status || 500).json({ message: e.message || 'Error del servidor' });
+      }
+    }
 
     const rawGender = (gender !== undefined ? gender : (genero !== undefined ? genero : sexo));
     const normalizedGender = rawGender == null
@@ -599,18 +650,20 @@ export const createUser = async (req, res) => {
         password,
         phone,
         role,
+        shop_id,
         photo_url,
         whatsapp_link,
         gender
       ) 
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING id, name as nombre, email, phone as telefono, role, photo_url, whatsapp_link, gender
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING id, name as nombre, email, phone as telefono, role, shop_id, photo_url, whatsapp_link, gender
     `, [
       finalName,
       email,
       hashedPassword,
       finalPhone,
       finalRole,
+      finalShopId,
       finalPhotoUrl,
       finalWhatsappLink != null ? String(finalWhatsappLink) : null,
       finalGender
@@ -673,6 +726,109 @@ export const updateUser = async (req, res) => {
     }
 
     const existing = existingResult.rows[0];
+
+    const requesterId = req.user?.userId;
+    const requesterRole = normalizeRole(req.user?.role);
+    const requesterIsAdmin = requesterRole.includes('admin');
+    const requesterIsOwner = requesterRole.includes('owner');
+
+    if (!requesterId) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    if (!requesterIsAdmin && !requesterIsOwner) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'Acceso denegado' });
+    }
+
+    if (requesterIsOwner && !requesterIsAdmin) {
+      const isSelf = String(requesterId) === String(id);
+      const targetRole = normalizeRole(existing.role);
+      const targetIsBarber = targetRole.includes('barber');
+
+      if (!isSelf && !targetIsBarber) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ message: 'Acceso denegado' });
+      }
+
+      const ownerShopsRes = await client.query(
+        `SELECT id
+         FROM barber_shops
+         WHERE owner_id = $1
+           AND deleted_at IS NULL`,
+        [requesterId]
+      );
+      const ownerShopIds = (ownerShopsRes.rows || [])
+        .map((r) => r.id)
+        .filter((v) => v != null)
+        .map((v) => Number(v))
+        .filter((v) => Number.isFinite(v));
+
+      // Validar intención de cambio de shop_id (si se envía)
+      let intendedShopId;
+      if (shop_id !== undefined) {
+        intendedShopId = shop_id;
+      } else if (shopId !== undefined) {
+        intendedShopId = shopId;
+      } else {
+        intendedShopId = undefined;
+      }
+
+      let parsedIntendedShopId = intendedShopId;
+      if (parsedIntendedShopId !== null && parsedIntendedShopId !== undefined) {
+        const parsed = Number(parsedIntendedShopId);
+        if (Number.isNaN(parsed)) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ message: 'shop_id inválido, debe ser numérico o null' });
+        }
+        parsedIntendedShopId = parsed;
+      }
+
+      const oldShopId = existing.shop_id ?? null;
+      const newShopId = intendedShopId === undefined ? oldShopId : (parsedIntendedShopId ?? null);
+      const ownsShop = (shopIdValue) => (
+        shopIdValue != null && ownerShopIds.some((sid) => String(sid) === String(shopIdValue))
+      );
+
+      if (isSelf) {
+        if (newShopId != null && !ownsShop(newShopId)) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({ message: 'Acceso denegado' });
+        }
+        if (role !== undefined) {
+          const nextRole = normalizeRole(role);
+          if (nextRole.includes('admin')) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ message: 'Acceso denegado' });
+          }
+        }
+      } else {
+        // Owner solo puede mover/asignar/desasignar barberos dentro de sus negocios
+        if (intendedShopId !== undefined) {
+          if (newShopId == null) {
+            if (oldShopId != null && !ownsShop(oldShopId)) {
+              await client.query('ROLLBACK');
+              return res.status(403).json({ message: 'Acceso denegado' });
+            }
+          } else if (!ownsShop(newShopId)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ message: 'Acceso denegado' });
+          }
+        } else {
+          // Si no se cambia shop, igual exigir que el barbero pertenezca a un negocio del owner o esté sin asignar
+          if (oldShopId != null && !ownsShop(oldShopId)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ message: 'Acceso denegado' });
+          }
+        }
+
+        if (role !== undefined) {
+          await client.query('ROLLBACK');
+          return res.status(403).json({ message: 'Acceso denegado' });
+        }
+      }
+    }
 
     // 2) Si se actualiza el email, verificar que no esté en uso por otro usuario
     if (email) {
@@ -746,12 +902,32 @@ export const updateUser = async (req, res) => {
     }
 
     // 5) Rol: si no viene nada, mantener el actual
-    const finalRole = role || existing.role;
+    const requesterRoleForFinal = normalizeRole(req.user?.role);
+    const requesterIsOwnerForFinal = requesterRoleForFinal.includes('owner');
+    const requesterIsAdminForFinal = requesterRoleForFinal.includes('admin');
+    let finalRole = role || existing.role;
+    if (requesterIsOwnerForFinal && !requesterIsAdminForFinal) {
+      const isSelf = String(req.user?.userId) === String(id);
+      if (!isSelf) {
+        finalRole = existing.role;
+      } else {
+        const wantsBarber = String(role || '').toLowerCase().includes('barber');
+        const hasBarber = normalizeRole(existing.role).includes('barber');
+        if (wantsBarber && !hasBarber) {
+          finalRole = `${existing.role} barber`;
+        } else {
+          finalRole = existing.role;
+        }
+      }
+    }
 
     // Permiso: si no viene nada, mantener el actual
-    const finalCanDeleteHistory = (canDeleteHistory !== undefined || can_delete_history !== undefined)
-      ? Boolean(canDeleteHistory !== undefined ? canDeleteHistory : can_delete_history)
-      : Boolean(existing.can_delete_history);
+    let finalCanDeleteHistory = Boolean(existing.can_delete_history);
+    if (!requesterIsOwnerForFinal || requesterIsAdminForFinal) {
+      finalCanDeleteHistory = (canDeleteHistory !== undefined || can_delete_history !== undefined)
+        ? Boolean(canDeleteHistory !== undefined ? canDeleteHistory : can_delete_history)
+        : Boolean(existing.can_delete_history);
+    }
 
     // 6) Ejecutar UPDATE con parámetros fijos
     const updateQuery = `
@@ -827,14 +1003,58 @@ export const deleteUser = async (req, res) => {
     const userData = checkResult.rows[0];
     logDbSuccess('INFO', `Usuario encontrado: ${userData.name || 'Sin nombre'} (${userData.email || 'Sin email'})`);
 
+    const requesterId = req.user?.userId;
+    const requesterRole = normalizeRole(req.user?.role);
+    if (!requesterId) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const isAdminRequester = requesterRole.includes('admin');
+    const isOwnerRequester = requesterRole.includes('owner');
+
+    if (!isAdminRequester && !isOwnerRequester) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'Acceso denegado' });
+    }
+
+    if (isOwnerRequester && String(requesterId) === String(id)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'Para eliminar tu cuenta de dueño usa la opción de eliminar cuenta.' });
+    }
+
     const roleStr = String(userData.role || '').toLowerCase();
     if (roleStr.includes('admin')) {
       await client.query('ROLLBACK');
       return res.status(403).json({ message: 'No puedes eliminar la cuenta de administrador.' });
     }
+
+    if (isOwnerRequester) {
+      if (!roleStr.includes('barber')) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ message: 'Solo puedes eliminar profesionales (barberos) de tus negocios.' });
+      }
+
+      const ownRes = await client.query(
+        `SELECT 1
+         FROM users b
+         JOIN barber_shops bs ON bs.id = b.shop_id
+         WHERE b.id = $1
+           AND bs.owner_id = $2
+           AND bs.deleted_at IS NULL
+         LIMIT 1`,
+        [id, requesterId]
+      );
+
+      if (ownRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ message: 'Acceso denegado' });
+      }
+    }
+
     if (roleStr.includes('owner')) {
       const countRes = await client.query(
-        'SELECT COUNT(*)::int as count FROM barber_shops WHERE owner_id = $1',
+        'SELECT COUNT(*)::int as count FROM barber_shops WHERE owner_id = $1 AND deleted_at IS NULL',
         [id]
       );
       const count = Number(countRes.rows[0]?.count ?? 0) || 0;

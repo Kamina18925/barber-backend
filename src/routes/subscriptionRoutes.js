@@ -12,6 +12,10 @@ import {
   getPaypalConfig,
   paypalCreateOrder,
   paypalCaptureOrder,
+  paypalCreateSubscription,
+  paypalConfirmSubscription,
+  paypalCancelSubscription,
+  paypalWebhook,
 } from '../controllers/subscriptionController.js';
 
 const router = express.Router();
@@ -29,5 +33,10 @@ router.get('/admin/payments', authenticateToken, authorizeRoles('admin'), listPa
 router.get('/paypal/config', getPaypalConfig);
 router.post('/paypal/create-order', authenticateToken, paypalCreateOrder);
 router.post('/paypal/capture-order', authenticateToken, paypalCaptureOrder);
+
+router.post('/paypal/subscriptions/create', authenticateToken, paypalCreateSubscription);
+router.post('/paypal/subscriptions/confirm', authenticateToken, paypalConfirmSubscription);
+router.post('/paypal/subscriptions/cancel', authenticateToken, paypalCancelSubscription);
+router.post('/paypal/webhook', paypalWebhook);
 
 export default router;

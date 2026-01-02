@@ -29,7 +29,7 @@ router.put('/:id/profile', authenticateToken, updateUserProfile);
 router.put('/:id/change-password', authenticateToken, changeUserPassword);
 router.delete('/:id/owner-account', authenticateToken, deleteOwnerAccount);
 
-router.put('/:id', authenticateToken, authorizeRoles('admin'), updateUser);
-router.delete('/:id', authenticateToken, authorizeRoles('admin'), deleteUser);
+router.put('/:id', authenticateToken, authorizeRoles('admin', 'owner'), updateUser);
+router.delete('/:id', authenticateToken, authorizeRoles('admin', 'owner'), deleteUser);
 
 export default router;

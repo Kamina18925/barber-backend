@@ -57,29 +57,83 @@ export const computeOwnerUsageCounts = async (client, ownerId) => {
   };
 };
 
-export const computeMonthlyPriceDop = ({ shopCount, professionalCount }) => {
-  const base = 500;
-  const extraShopPrice = 400;
-  const extraProfessionalPrice = 250;
+const PLAN_TIERS = [
+  {
+    code: 'basic_1',
+    name: 'Básico 1',
+    priceDop: 1000,
+    limits: { shops: 1, professionals: 2 },
+  },
+  {
+    code: 'basic_2',
+    name: 'Básico 2',
+    priceDop: 1500,
+    limits: { shops: 1, professionals: 3 },
+  },
+  {
+    code: 'pro',
+    name: 'Pro',
+    priceDop: 2000,
+    limits: { shops: 2, professionals: 6 },
+  },
+  {
+    code: 'premium',
+    name: 'Premium',
+    priceDop: 2500,
+    limits: { shops: 3, professionals: 12 },
+  },
+];
 
-  const normalizedShopCount = Math.max(0, Number(shopCount) || 0);
-  const normalizedProfessionalCount = Math.max(0, Number(professionalCount) || 0);
+const selectTierForUsage = ({ shopCount, professionalCount }) => {
+  const shops = Math.max(0, Number(shopCount) || 0);
+  const pros = Math.max(0, Number(professionalCount) || 0);
 
-  const extraShops = Math.max(0, normalizedShopCount - 1);
-  const includedProfessionals = Math.max(1, normalizedShopCount);
-  const extraProfessionals = Math.max(0, normalizedProfessionalCount - includedProfessionals);
+  const tier = PLAN_TIERS.find((t) => shops <= t.limits.shops && pros <= t.limits.professionals) || null;
+  const maxTier = PLAN_TIERS[PLAN_TIERS.length - 1];
 
-  const total = base + (extraShops * extraShopPrice) + (extraProfessionals * extraProfessionalPrice);
+  const overShops = Math.max(0, shops - maxTier.limits.shops);
+  const overProfessionals = Math.max(0, pros - maxTier.limits.professionals);
+  const isOverLimit = tier == null && (overShops > 0 || overProfessionals > 0);
 
   return {
+    tier,
+    isOverLimit,
+    overage: {
+      shops: overShops,
+      professionals: overProfessionals,
+    },
+    normalized: {
+      shopCount: shops,
+      professionalCount: pros,
+    },
+  };
+};
+
+export const computeMonthlyPriceDop = ({ shopCount, professionalCount }) => {
+  const usage = selectTierForUsage({ shopCount, professionalCount });
+
+  if (!usage.tier && usage.isOverLimit) {
+    return {
+      currency: 'DOP',
+      tier: null,
+      total: null,
+      isOverLimit: true,
+      overage: usage.overage,
+    };
+  }
+
+  const tier = usage.tier || PLAN_TIERS[0];
+  return {
     currency: 'DOP',
-    base,
-    extraShopPrice,
-    extraProfessionalPrice,
-    extraShops,
-    includedProfessionals,
-    extraProfessionals,
-    total,
+    tier: {
+      code: tier.code,
+      name: tier.name,
+      priceDop: tier.priceDop,
+      limits: tier.limits,
+    },
+    total: tier.priceDop,
+    isOverLimit: false,
+    overage: usage.overage,
   };
 };
 

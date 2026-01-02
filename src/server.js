@@ -1,10 +1,14 @@
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import app from './app.js';
 import pool from './db/connection.js';
 import { cleanupDeletedNotifications } from './controllers/notificationController.js';
 
 // Cargar variables de entorno
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 // Puerto (usar 3000 por defecto si no hay variable de entorno PORT)
 const PORT = process.env.PORT || 3000;
@@ -382,6 +386,12 @@ const ensureSubscriptionTablesExist = async () => {
         id SERIAL PRIMARY KEY,
         owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         status TEXT NOT NULL DEFAULT 'inactive',
+        plan_code TEXT,
+        billing_provider TEXT,
+        paypal_subscription_id TEXT,
+        paypal_subscription_status TEXT,
+        pending_plan_code TEXT,
+        pending_plan_effective_at TIMESTAMP,
         current_period_start TIMESTAMP,
         current_period_end TIMESTAMP,
         grace_period_end TIMESTAMP,
@@ -390,6 +400,31 @@ const ensureSubscriptionTablesExist = async () => {
         updated_at TIMESTAMP DEFAULT NOW(),
         UNIQUE (owner_id)
       )`
+    );
+
+    await pool.query(
+      `ALTER TABLE subscriptions
+       ADD COLUMN IF NOT EXISTS plan_code TEXT`
+    );
+    await pool.query(
+      `ALTER TABLE subscriptions
+       ADD COLUMN IF NOT EXISTS billing_provider TEXT`
+    );
+    await pool.query(
+      `ALTER TABLE subscriptions
+       ADD COLUMN IF NOT EXISTS paypal_subscription_id TEXT`
+    );
+    await pool.query(
+      `ALTER TABLE subscriptions
+       ADD COLUMN IF NOT EXISTS paypal_subscription_status TEXT`
+    );
+    await pool.query(
+      `ALTER TABLE subscriptions
+       ADD COLUMN IF NOT EXISTS pending_plan_code TEXT`
+    );
+    await pool.query(
+      `ALTER TABLE subscriptions
+       ADD COLUMN IF NOT EXISTS pending_plan_effective_at TIMESTAMP`
     );
 
     await pool.query(
@@ -427,6 +462,9 @@ const ensureSubscriptionTablesExist = async () => {
 
     await pool.query(
       `CREATE INDEX IF NOT EXISTS idx_payments_owner_id ON payments(owner_id)`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_subscriptions_paypal_subscription_id ON subscriptions(paypal_subscription_id)`
     );
     await pool.query(
       `CREATE INDEX IF NOT EXISTS idx_manual_payment_reports_owner_id ON manual_payment_reports(owner_id)`
