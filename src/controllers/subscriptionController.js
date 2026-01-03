@@ -435,6 +435,29 @@ export const paypalChangeSubscriptionPlan = async (req, res) => {
 
     const accessToken = await getPaypalAccessToken();
     const baseUrl = getPaypalBaseUrl();
+
+    const infoRes = await fetch(`${baseUrl}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    const infoData = await infoRes.json().catch(() => null);
+    if (!infoRes.ok) {
+      const err = new Error(infoData?.message || 'No se pudo consultar la suscripción PayPal');
+      err.status = 502;
+      err.details = infoData;
+      throw err;
+    }
+
+    const currentStatus = String(infoData?.status || '').trim().toUpperCase();
+    if (currentStatus && currentStatus !== 'ACTIVE') {
+      return res.status(409).json({
+        message: `La suscripción PayPal no está activa (estado=${currentStatus}). Presiona “Confirmar” y espera a que esté ACTIVE antes de cambiar el plan.`,
+      });
+    }
+
     const appUrl = getPublicAppUrl(req);
     const returnUrl = `${appUrl}/?paypal_subscription_success=1`;
     const cancelUrl = `${appUrl}/?paypal_subscription_cancel=1`;
