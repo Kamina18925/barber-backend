@@ -15,6 +15,7 @@ import {
   paypalCreateSubscription,
   paypalConfirmSubscription,
   paypalCancelSubscription,
+  paypalChangeSubscriptionPlan,
   paypalWebhook,
 } from '../controllers/subscriptionController.js';
 
@@ -37,6 +38,7 @@ router.post('/paypal/capture-order', authenticateToken, paypalCaptureOrder);
 router.post('/paypal/subscriptions/create', authenticateToken, paypalCreateSubscription);
 router.post('/paypal/subscriptions/confirm', authenticateToken, paypalConfirmSubscription);
 router.post('/paypal/subscriptions/cancel', authenticateToken, paypalCancelSubscription);
+router.post('/paypal/subscriptions/change-plan', authenticateToken, paypalChangeSubscriptionPlan);
 router.post('/paypal/webhook', paypalWebhook);
 
 export default router;

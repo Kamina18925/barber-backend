@@ -15,6 +15,18 @@ const canAccessOwner = (req, ownerId) => {
   return uid != null && String(uid) === String(ownerId);
 };
 
+const PLAN_TIERS = [
+  { code: 'basic_1', name: 'Básico 1', priceDop: 1000, limits: { shops: 1, professionals: 2 } },
+  { code: 'basic_2', name: 'Básico 2', priceDop: 1500, limits: { shops: 1, professionals: 3 } },
+  { code: 'pro', name: 'Pro', priceDop: 2000, limits: { shops: 2, professionals: 6 } },
+  { code: 'premium', name: 'Premium', priceDop: 2500, limits: { shops: 3, professionals: 12 } },
+];
+
+const getTierForCode = (planCode) => {
+  const code = String(planCode || '').trim();
+  return PLAN_TIERS.find((t) => t.code === code) || null;
+};
+
 const VALID_PLAN_CODES = new Set(['basic_1', 'basic_2', 'pro', 'premium']);
 
 const getPaypalPlanIdForCode = (planCode) => {
@@ -287,36 +299,46 @@ export const paypalConfirmSubscription = async (req, res) => {
       return res.status(400).json({ message: 'subscriptionId no coincide con el owner' });
     }
 
-    const pendingPlan = sub.pending_plan_code || planCodeFromPaypal || sub.plan_code || null;
+    // Source of truth for the paid plan is PayPal's plan_id.
+    // Do NOT overwrite plan_code on APPROVAL_PENDING or other non-ACTIVE states.
+    if (status !== 'ACTIVE') {
+      await client.query(
+        `UPDATE subscriptions
+         SET billing_provider = 'paypal',
+             paypal_subscription_status = $2,
+             updated_at = NOW()
+         WHERE owner_id = $1`,
+        [ownerId, status]
+      );
+      await client.query('COMMIT');
+      return res.json({ success: true, paypal: ppData });
+    }
+
+    const resolvedPlanCode = planCodeFromPaypal || sub.pending_plan_code || sub.plan_code || null;
     const nextBillingIso = ppData?.billing_info?.next_billing_time || null;
     const now = new Date();
     const nextBilling = nextBillingIso ? new Date(nextBillingIso) : null;
-    const periodEnd = nextBilling && !Number.isNaN(nextBilling.getTime()) ? nextBilling : new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const periodEnd =
+      nextBilling && !Number.isNaN(nextBilling.getTime())
+        ? nextBilling
+        : new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
     const graceEnd = new Date(periodEnd.getTime() + 5 * 24 * 60 * 60 * 1000);
 
     await client.query(
       `UPDATE subscriptions
-       SET status = $2,
-           plan_code = COALESCE($3, plan_code),
+       SET status = 'active',
+           plan_code = COALESCE($2, plan_code),
            billing_provider = 'paypal',
-           paypal_subscription_status = $4,
+           paypal_subscription_status = $3,
            pending_plan_code = NULL,
            pending_plan_effective_at = NULL,
-           current_period_start = $5,
-           current_period_end = $6,
-           grace_period_end = $7,
+           current_period_start = $4,
+           current_period_end = $5,
+           grace_period_end = $6,
            updated_at = NOW()
        WHERE owner_id = $1
        RETURNING *`,
-      [
-        ownerId,
-        status === 'ACTIVE' ? 'active' : 'inactive',
-        pendingPlan,
-        status,
-        now.toISOString(),
-        periodEnd.toISOString(),
-        graceEnd.toISOString(),
-      ]
+      [ownerId, resolvedPlanCode, status, now.toISOString(), periodEnd.toISOString(), graceEnd.toISOString()]
     );
 
     await client.query('COMMIT');
@@ -377,6 +399,95 @@ export const paypalCancelSubscription = async (req, res) => {
     return res.json({ success: true });
   } catch (error) {
     console.error('Error paypalCancelSubscription:', error);
+    return res.status(error.status || 500).json({ message: error.message || 'Error del servidor' });
+  } finally {
+    client.release();
+  }
+};
+
+export const paypalChangeSubscriptionPlan = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const ownerId = req.user?.userId;
+    if (!ownerId) return res.status(401).json({ message: 'Authentication required' });
+
+    const role = normalizeRole(req.user?.role);
+    if (!role.includes('admin') && !role.includes('owner')) {
+      return res.status(403).json({ message: 'Acceso denegado' });
+    }
+
+    const { planCode } = req.body || {};
+    const code = String(planCode || '').trim();
+    if (!VALID_PLAN_CODES.has(code)) {
+      return res.status(400).json({ message: 'planCode inválido' });
+    }
+
+    const planId = getPaypalPlanIdForCode(code);
+    if (!planId) {
+      return res.status(500).json({ message: `Falta configurar PAYPAL_PLAN_ID_* para planCode=${code}` });
+    }
+
+    const sub = await getOrCreateOwnerSubscription(client, ownerId);
+    const subscriptionId = sub.paypal_subscription_id;
+    if (!subscriptionId) {
+      return res.status(400).json({ message: 'No hay suscripción PayPal existente para cambiar de plan' });
+    }
+
+    const accessToken = await getPaypalAccessToken();
+    const baseUrl = getPaypalBaseUrl();
+    const appUrl = getPublicAppUrl(req);
+    const returnUrl = `${appUrl}/?paypal_subscription_success=1`;
+    const cancelUrl = `${appUrl}/?paypal_subscription_cancel=1`;
+
+    const payload = {
+      plan_id: planId,
+      application_context: {
+        brand_name: 'Stylex',
+        locale: 'es-DO',
+        shipping_preference: 'NO_SHIPPING',
+        user_action: 'SUBSCRIBE_NOW',
+        return_url: returnUrl,
+        cancel_url: cancelUrl,
+      },
+    };
+
+    const ppRes = await fetch(
+      `${baseUrl}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}/revise`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    const ppData = await ppRes.json().catch(() => null);
+    if (!ppRes.ok) {
+      const err = new Error(ppData?.message || 'Error cambiando plan de suscripción PayPal');
+      err.status = 502;
+      err.details = ppData;
+      throw err;
+    }
+
+    const approveLink = Array.isArray(ppData?.links)
+      ? ppData.links.find((l) => String(l?.rel || '').toLowerCase() === 'approve')
+      : null;
+    const approvalUrl = approveLink?.href || null;
+
+    await client.query(
+      `UPDATE subscriptions
+       SET pending_plan_code = $2,
+           pending_plan_effective_at = NULL,
+           updated_at = NOW()
+       WHERE owner_id = $1`,
+      [ownerId, code]
+    );
+
+    return res.json({ success: true, approvalUrl, raw: ppData });
+  } catch (error) {
+    console.error('Error paypalChangeSubscriptionPlan:', error);
     return res.status(error.status || 500).json({ message: error.message || 'Error del servidor' });
   } finally {
     client.release();
@@ -866,6 +977,9 @@ export const getOwnerSubscriptionSummary = async (req, res) => {
     const pricing = computeMonthlyPriceDop(usage);
     const state = computeSubscriptionState(sub);
 
+    const currentPlan = getTierForCode(sub.plan_code);
+    const recommendedPlan = pricing?.tier || null;
+
     const transfer = getTransferConfig();
 
     return res.json({
@@ -882,6 +996,8 @@ export const getOwnerSubscriptionSummary = async (req, res) => {
         current_period_end: sub.current_period_end,
         grace_period_end: sub.grace_period_end,
       },
+      currentPlan,
+      recommendedPlan,
       state: {
         isActive: state.isActive,
         isInGrace: state.isInGrace,
