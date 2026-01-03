@@ -279,6 +279,24 @@ export const paypalConfirmSubscription = async (req, res) => {
 
     const ppData = await ppRes.json().catch(() => null);
     if (!ppRes.ok) {
+      const ppName = String(ppData?.name || '').trim();
+      if (ppName === 'RESOURCE_NOT_FOUND') {
+        await client.query(
+          `UPDATE subscriptions
+           SET paypal_subscription_id = NULL,
+               paypal_subscription_status = NULL,
+               pending_plan_code = NULL,
+               pending_plan_effective_at = NULL,
+               updated_at = NOW()
+           WHERE owner_id = $1`,
+          [ownerId]
+        );
+        return res.status(409).json({
+          message:
+            'La suscripción PayPal guardada ya no existe en PayPal Sandbox. Se restableció en el sistema. Vuelve a crear la suscripción (botón “Suscribirme”) y luego presiona “Confirmar”.',
+        });
+      }
+
       const err = new Error(ppData?.message || 'Error consultando suscripción de PayPal');
       err.status = 502;
       err.details = ppData;
@@ -445,6 +463,24 @@ export const paypalChangeSubscriptionPlan = async (req, res) => {
     });
     const infoData = await infoRes.json().catch(() => null);
     if (!infoRes.ok) {
+      const ppName = String(infoData?.name || '').trim();
+      if (ppName === 'RESOURCE_NOT_FOUND') {
+        await client.query(
+          `UPDATE subscriptions
+           SET paypal_subscription_id = NULL,
+               paypal_subscription_status = NULL,
+               pending_plan_code = NULL,
+               pending_plan_effective_at = NULL,
+               updated_at = NOW()
+           WHERE owner_id = $1`,
+          [ownerId]
+        );
+        return res.status(409).json({
+          message:
+            'La suscripción PayPal guardada ya no existe en PayPal Sandbox. Se restableció en el sistema. Vuelve a crear la suscripción (botón “Suscribirme”) y luego podrás actualizar el plan.',
+        });
+      }
+
       const err = new Error(infoData?.message || 'No se pudo consultar la suscripción PayPal');
       err.status = 502;
       err.details = infoData;
@@ -455,6 +491,32 @@ export const paypalChangeSubscriptionPlan = async (req, res) => {
     if (currentStatus && currentStatus !== 'ACTIVE') {
       return res.status(409).json({
         message: `La suscripción PayPal no está activa (estado=${currentStatus}). Presiona “Confirmar” y espera a que esté ACTIVE antes de cambiar el plan.`,
+      });
+    }
+
+    const planRes = await fetch(`${baseUrl}/v1/billing/plans/${encodeURIComponent(planId)}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    const planData = await planRes.json().catch(() => null);
+    if (!planRes.ok) {
+      const ppName = String(planData?.name || '').trim();
+      const ppMsg = String(planData?.message || '').trim();
+      console.error('PayPal plan lookup failed', {
+        paypalName: ppName,
+        paypalMessage: ppMsg,
+        subscriptionId,
+        planId,
+        mode: String(process.env.PAYPAL_MODE || 'sandbox'),
+      });
+
+      return res.status(400).json({
+        message:
+          'El plan de PayPal configurado no existe en este ambiente/cuenta. ' +
+          'Verifica PAYPAL_MODE y PAYPAL_PLAN_ID_* (deben ser del mismo sandbox/live y del mismo merchant que creó la suscripción).',
       });
     }
 
@@ -488,7 +550,29 @@ export const paypalChangeSubscriptionPlan = async (req, res) => {
 
     const ppData = await ppRes.json().catch(() => null);
     if (!ppRes.ok) {
-      const err = new Error(ppData?.message || 'Error cambiando plan de suscripción PayPal');
+      const ppName = String(ppData?.name || '').trim();
+      const ppMsg = String(ppData?.message || '').trim();
+      const detailIssue = Array.isArray(ppData?.details) && ppData.details.length
+        ? String(ppData.details[0]?.issue || ppData.details[0]?.description || '').trim()
+        : '';
+
+      console.error('PayPal revise failed', {
+        paypalName: ppName,
+        paypalMessage: ppMsg,
+        paypalIssue: detailIssue,
+        subscriptionId,
+        planId,
+        mode: String(process.env.PAYPAL_MODE || 'sandbox'),
+      });
+
+      if (ppName === 'RESOURCE_NOT_FOUND') {
+        const msg =
+          'PayPal no encontró el recurso para cambiar el plan. Usualmente pasa si la suscripción o el plan no pertenecen a estas credenciales/ambiente (sandbox vs live). ' +
+          'Verifica PAYPAL_MODE y que los PAYPAL_PLAN_ID_* sean del mismo ambiente/cuenta que creó la suscripción.';
+        return res.status(400).json({ message: msg });
+      }
+
+      const err = new Error(ppMsg || 'Error cambiando plan de suscripción PayPal');
       err.status = 502;
       err.details = ppData;
       throw err;
