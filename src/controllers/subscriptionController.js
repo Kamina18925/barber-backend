@@ -391,6 +391,8 @@ export const paypalCancelSubscription = async (req, res) => {
     await client.query(
       `UPDATE subscriptions
        SET paypal_subscription_status = 'CANCELLED',
+           pending_plan_code = NULL,
+           pending_plan_effective_at = NULL,
            updated_at = NOW()
        WHERE owner_id = $1`,
       [ownerId]
@@ -431,6 +433,13 @@ export const paypalChangeSubscriptionPlan = async (req, res) => {
     const subscriptionId = sub.paypal_subscription_id;
     if (!subscriptionId) {
       return res.status(400).json({ message: 'No hay suscripción PayPal existente para cambiar de plan' });
+    }
+
+    const currentPaypalStatus = String(sub.paypal_subscription_status || '').toUpperCase();
+    if (currentPaypalStatus === 'CANCELLED') {
+      return res
+        .status(400)
+        .json({ message: 'La suscripción PayPal está cancelada. Debes crear una nueva suscripción para volver a pagar.' });
     }
 
     const accessToken = await getPaypalAccessToken();
