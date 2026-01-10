@@ -1,4 +1,5 @@
 import pool from '../db/connection.js';
+import { sendPushToUser } from './fcmService.js';
 
 const normalizeRole = (role) => String(role || '').toLowerCase();
 
@@ -148,10 +149,6 @@ export const getOrCreateOwnerSubscription = async (client, ownerId) => {
 
   if (existing.rows.length > 0) return existing.rows[0];
 
-  const now = new Date();
-  const periodEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-  const graceEnd = new Date(periodEnd.getTime() + 5 * 24 * 60 * 60 * 1000);
-
   const insert = await client.query(
     `INSERT INTO subscriptions (
       owner_id,
@@ -160,9 +157,9 @@ export const getOrCreateOwnerSubscription = async (client, ownerId) => {
       current_period_end,
       grace_period_end,
       last_alert_sent_at
-    ) VALUES ($1, $2, $3, $4, $5, NULL)
+    ) VALUES ($1, $2, NULL, NULL, NULL, NULL)
     RETURNING *`,
-    [ownerId, 'active', now.toISOString(), periodEnd.toISOString(), graceEnd.toISOString()]
+    [ownerId, 'inactive']
   );
 
   return insert.rows[0];
@@ -234,6 +231,19 @@ export const ensureDailySubscriptionExpiredNotification = async (client, ownerId
      WHERE owner_id = $1`,
     [ownerId]
   );
+
+  try {
+    await sendPushToUser(ownerId, {
+      title: 'StyleX',
+      body: message,
+      data: {
+        type: 'SUBSCRIPTION_EXPIRED',
+        ownerId: String(ownerId),
+      },
+    });
+  } catch {
+    // ignore
+  }
 };
 
 export const enforceShopSubscriptionForBooking = async (client, shopId) => {
@@ -264,6 +274,17 @@ export const enforceShopSubscriptionForBooking = async (client, shopId) => {
   await ensureDailySubscriptionExpiredNotification(client, ownerId, subscription);
 
   if (state.isBlocked) {
+    if (!state.periodEnd) {
+      const err = new Error('Este negocio requiere una suscripción activa para aceptar citas.');
+      err.status = 402;
+      err.details = {
+        ownerId,
+        periodEnd: null,
+        graceEnd: null,
+      };
+      throw err;
+    }
+
     const blockDate = state.graceEnd ? state.graceEnd.toISOString().slice(0, 10) : null;
     const err = new Error(
       blockDate
@@ -299,6 +320,17 @@ export const enforceOwnerSubscriptionForManagement = async (client, ownerId) => 
   await ensureDailySubscriptionExpiredNotification(client, ownerId, subscription);
 
   if (state.isBlocked) {
+    if (!state.periodEnd) {
+      const err = new Error('Debes activar tu suscripción para crear o gestionar negocios.');
+      err.status = 402;
+      err.details = {
+        ownerId,
+        periodEnd: null,
+        graceEnd: null,
+      };
+      throw err;
+    }
+
     const blockDate = state.graceEnd ? state.graceEnd.toISOString().slice(0, 10) : null;
     const err = new Error(
       blockDate

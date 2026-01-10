@@ -66,7 +66,14 @@ export const getAllBarberShops = async (req, res) => {
         COALESCE(rv.avg_rating, bs.rating, 0.0) as rating,
         COALESCE(rv.review_count, 0) as review_count,
         u.name as owner_name,
-        u.id as owner_id
+        u.id as owner_id,
+        COALESCE((
+          SELECT ARRAY_AGG(ub.id ORDER BY ub.name)
+          FROM users ub
+          WHERE ub.shop_id = bs.id
+            AND ub.deleted_at IS NULL
+            AND LOWER(COALESCE(ub.role, '')) LIKE '%barber%'
+        ), ARRAY[]::int[]) as barber_ids
       FROM barber_shops bs
       LEFT JOIN (
         SELECT shop_id,
@@ -102,7 +109,14 @@ export const getBarberShopsByOwner = async (req, res) => {
         schedule,
         COALESCE(categories, ARRAY['barberia']::text[]) as categories,
         rating,
-        owner_id
+        owner_id,
+        COALESCE((
+          SELECT ARRAY_AGG(ub.id ORDER BY ub.name)
+          FROM users ub
+          WHERE ub.shop_id = barber_shops.id
+            AND ub.deleted_at IS NULL
+            AND LOWER(COALESCE(ub.role, '')) LIKE '%barber%'
+        ), ARRAY[]::int[]) as barber_ids
       FROM barber_shops
       WHERE owner_id = $1
       ${includeArchived ? '' : 'AND deleted_at IS NULL'}
@@ -164,7 +178,7 @@ export const getBarberShopById = async (req, res) => {
         specialties,
         shop_id
       FROM users
-      WHERE shop_id = $1 AND LOWER(role) = 'barber'
+      WHERE shop_id = $1 AND role ILIKE '%barber%'
       ORDER BY name
       `,
       [id]

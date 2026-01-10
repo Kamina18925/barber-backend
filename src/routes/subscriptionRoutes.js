@@ -5,6 +5,7 @@ import {
   listOwnerPayments,
   listPaymentsAdmin,
   createManualPaymentReport,
+  setOwnerPendingPlan,
   listManualPaymentReports,
   approveManualPaymentReport,
   rejectManualPaymentReport,
@@ -23,6 +24,7 @@ const router = express.Router();
 
 router.get('/owner/:ownerId', authenticateToken, getOwnerSubscriptionSummary);
 router.get('/owner/:ownerId/payments', authenticateToken, listOwnerPayments);
+router.post('/owner/:ownerId/pending-plan', authenticateToken, setOwnerPendingPlan);
 router.post('/manual-report', authenticateToken, createManualPaymentReport);
 
 router.get('/admin/manual-reports', authenticateToken, authorizeRoles('admin'), listManualPaymentReports);

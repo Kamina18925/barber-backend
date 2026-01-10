@@ -5,6 +5,7 @@ import {
   getUserById,
   getCurrentUserProfile,
   getVisibleUsers,
+  getPublicBarbersByShop,
   createUser,
   updateUser,
   deleteUser,
@@ -20,6 +21,8 @@ const router = express.Router();
 router.post('/login', loginUser);
 
 router.post('/', createUser);
+
+router.get('/barbers/shop/:shopId', getPublicBarbersByShop);
 
 router.get('/', authenticateToken, authorizeRoles('admin'), getAllUsers);
 router.get('/profile', authenticateToken, getCurrentUserProfile);

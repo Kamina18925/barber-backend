@@ -18,6 +18,7 @@ import chatRoutes from './routes/chatRoutes.js';
 import notificationRoutes from './routes/notificationRoutes.js';
 import subscriptionRoutes from './routes/subscriptionRoutes.js';
 import locationRoutes from './routes/locationRoutes.js';
+import pushRoutes from './routes/pushRoutes.js';
 
 const app = express();
 
@@ -59,6 +60,7 @@ app.use('/api/chat', chatRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
 app.use('/api/location', locationRoutes);
+app.use('/api/push', pushRoutes);
 
 // Ruta de prueba
 app.get('/api/test', (req, res) => {

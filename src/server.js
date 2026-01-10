@@ -192,6 +192,23 @@ const ensureCoreTablesExist = async () => {
         expires_at TIMESTAMP
       )`
     );
+
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS fcm_tokens (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token TEXT NOT NULL UNIQUE,
+        platform TEXT,
+        device_id TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        last_seen_at TIMESTAMP
+      )`
+    );
+
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS idx_fcm_tokens_user_id ON fcm_tokens(user_id)`
+    );
   } catch (error) {
     console.error('Error asegurando tablas core:', error);
   }
@@ -542,9 +559,10 @@ const startServer = async () => {
    }, 12 * 60 * 60 * 1000);
 
    // Iniciar servidor
-   const server = app.listen(PORT, () => {
+   const HOST = process.env.HOST || '0.0.0.0';
+   const server = app.listen(PORT, HOST, () => {
      console.log(`Servidor corriendo en el puerto ${PORT}`);
-     console.log(`API disponible en http://localhost:${PORT}/api`);
+     console.log(`API disponible en http://${HOST === '0.0.0.0' ? '127.0.0.1' : HOST}:${PORT}/api`);
    });
 
    const shutdown = async (exitCode = 0, shouldExit = true) => {

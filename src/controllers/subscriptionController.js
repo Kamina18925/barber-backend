@@ -5,6 +5,7 @@ import {
   computeSubscriptionState,
   getOrCreateOwnerSubscription,
 } from '../services/subscriptionService.js';
+import { sendPushToAdmins } from '../services/fcmService.js';
 
 const normalizeRole = (role) => String(role || '').toLowerCase();
 
@@ -136,6 +137,56 @@ const requireAdmin = (req) => {
     const err = new Error('Acceso denegado: solo admin');
     err.status = 403;
     throw err;
+  }
+};
+
+export const setOwnerPendingPlan = async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { ownerId } = req.params;
+    if (!ownerId) return res.status(400).json({ message: 'ownerId requerido' });
+
+    if (!req.user?.userId) return res.status(401).json({ message: 'Authentication required' });
+    if (!canAccessOwner(req, ownerId)) {
+      return res.status(403).json({ message: 'Acceso denegado' });
+    }
+
+    const { planCode } = req.body || {};
+    const code = String(planCode || '').trim();
+    if (!VALID_PLAN_CODES.has(code)) {
+      return res.status(400).json({ message: 'planCode inválido' });
+    }
+
+    await client.query('BEGIN');
+    const sub = await getOrCreateOwnerSubscription(client, ownerId);
+    const effectiveAt = sub?.current_period_end ? new Date(sub.current_period_end) : null;
+
+    const existingPending = sub?.pending_plan_code ? String(sub.pending_plan_code).trim() : null;
+    const currentPlan = sub?.plan_code ? String(sub.plan_code).trim() : null;
+    if (existingPending && currentPlan && existingPending !== currentPlan && existingPending !== code) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        message: 'Ya hay un cambio de plan pendiente. Espera al próximo ciclo o cancela la suscripción para cambiar de inmediato.',
+      });
+    }
+
+    await client.query(
+      `UPDATE subscriptions
+       SET pending_plan_code = $2,
+           pending_plan_effective_at = COALESCE($3, pending_plan_effective_at),
+           updated_at = NOW()
+       WHERE owner_id = $1`,
+      [ownerId, code, effectiveAt && !Number.isNaN(effectiveAt.getTime()) ? effectiveAt.toISOString() : null]
+    );
+
+    await client.query('COMMIT');
+    return res.json({ success: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error setOwnerPendingPlan:', error);
+    return res.status(error.status || 500).json({ message: error.message || 'Error del servidor' });
+  } finally {
+    client.release();
   }
 };
 
@@ -292,11 +343,22 @@ export const paypalConfirmSubscription = async (req, res) => {
 
     const planCodeFromPaypal = getPlanCodeForPaypalPlanId(ppData?.plan_id);
 
+    const customId = String(ppData?.custom_id || '').trim();
+    const customMatch = customId.match(/^owner_(\d+)_plan_(.+)$/i);
+    const customOwnerId = customMatch ? customMatch[1] : null;
+    const customPlanCode = customMatch ? customMatch[2] : null;
+
+    if (customOwnerId && String(customOwnerId) !== String(ownerId)) {
+      return res.status(403).json({ message: 'Acceso denegado (ownerId inválido en PayPal custom_id)' });
+    }
+
     await client.query('BEGIN');
     const sub = await getOrCreateOwnerSubscription(client, ownerId);
-    if (String(sub.paypal_subscription_id || '') !== String(subscriptionId)) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ message: 'subscriptionId no coincide con el owner' });
+    if (sub.paypal_subscription_id && String(sub.paypal_subscription_id || '') !== String(subscriptionId)) {
+      if (!customOwnerId) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'subscriptionId no coincide con el owner' });
+      }
     }
 
     // Source of truth for the paid plan is PayPal's plan_id.
@@ -305,16 +367,17 @@ export const paypalConfirmSubscription = async (req, res) => {
       await client.query(
         `UPDATE subscriptions
          SET billing_provider = 'paypal',
-             paypal_subscription_status = $2,
+             paypal_subscription_id = $2,
+             paypal_subscription_status = $3,
              updated_at = NOW()
          WHERE owner_id = $1`,
-        [ownerId, status]
+        [ownerId, subscriptionId, status]
       );
       await client.query('COMMIT');
       return res.json({ success: true, paypal: ppData });
     }
 
-    const resolvedPlanCode = planCodeFromPaypal || sub.pending_plan_code || sub.plan_code || null;
+    const resolvedPlanCode = planCodeFromPaypal || customPlanCode || sub.plan_code || null;
     const nextBillingIso = ppData?.billing_info?.next_billing_time || null;
     const now = new Date();
     const nextBilling = nextBillingIso ? new Date(nextBillingIso) : null;
@@ -324,22 +387,215 @@ export const paypalConfirmSubscription = async (req, res) => {
         : new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
     const graceEnd = new Date(periodEnd.getTime() + 5 * 24 * 60 * 60 * 1000);
 
-    await client.query(
-      `UPDATE subscriptions
-       SET status = 'active',
-           plan_code = COALESCE($2, plan_code),
-           billing_provider = 'paypal',
-           paypal_subscription_status = $3,
-           pending_plan_code = NULL,
-           pending_plan_effective_at = NULL,
-           current_period_start = $4,
-           current_period_end = $5,
-           grace_period_end = $6,
-           updated_at = NOW()
-       WHERE owner_id = $1
-       RETURNING *`,
-      [ownerId, resolvedPlanCode, status, now.toISOString(), periodEnd.toISOString(), graceEnd.toISOString()]
-    );
+    const dbPlanCode = sub?.plan_code ? String(sub.plan_code).trim() : null;
+    const dbPendingCode = sub?.pending_plan_code ? String(sub.pending_plan_code).trim() : null;
+    const appliedPlanCode = planCodeFromPaypal || customPlanCode || null;
+
+    const isExistingActiveSub = Boolean(dbPlanCode) && String(sub?.status || '').toLowerCase() === 'active';
+    const isPlanChangeDetected =
+      isExistingActiveSub &&
+      appliedPlanCode != null &&
+      String(appliedPlanCode).trim() !== String(dbPlanCode);
+
+    const pendingCode = isPlanChangeDetected ? String(appliedPlanCode).trim() : dbPendingCode;
+    const shouldClearPending =
+      !pendingCode ||
+      (
+        appliedPlanCode != null &&
+        String(appliedPlanCode).trim() === String(pendingCode) &&
+        (!dbPlanCode || String(dbPlanCode).trim() === String(pendingCode))
+      );
+
+    const periodEndIso = periodEnd.toISOString();
+    const nowIso = now.toISOString();
+    const graceEndIso = graceEnd.toISOString();
+
+    if (isPlanChangeDetected) {
+      await client.query(
+        `UPDATE subscriptions
+         SET status = 'active',
+             plan_code = plan_code,
+             billing_provider = 'paypal',
+             paypal_subscription_id = $6,
+             paypal_subscription_status = $2,
+             pending_plan_code = $7,
+             pending_plan_effective_at = COALESCE(pending_plan_effective_at, $4),
+             current_period_start = $3,
+             current_period_end = $4,
+             grace_period_end = $5,
+             updated_at = NOW()
+         WHERE owner_id = $1
+         RETURNING *`,
+        [ownerId, status, nowIso, periodEndIso, graceEndIso, subscriptionId, pendingCode]
+      );
+    } else if (shouldClearPending) {
+      await client.query(
+        `UPDATE subscriptions
+         SET status = 'active',
+             plan_code = COALESCE($2, plan_code),
+             billing_provider = 'paypal',
+             paypal_subscription_id = $7,
+             paypal_subscription_status = $3,
+             pending_plan_code = NULL,
+             pending_plan_effective_at = NULL,
+             current_period_start = $4,
+             current_period_end = $5,
+             grace_period_end = $6,
+             updated_at = NOW()
+         WHERE owner_id = $1
+         RETURNING *`,
+        [ownerId, resolvedPlanCode, status, nowIso, periodEndIso, graceEndIso, subscriptionId]
+      );
+    } else {
+      await client.query(
+        `UPDATE subscriptions
+         SET status = 'active',
+             plan_code = COALESCE($2, plan_code),
+             billing_provider = 'paypal',
+             paypal_subscription_id = $7,
+             paypal_subscription_status = $3,
+             pending_plan_code = $8,
+             pending_plan_effective_at = COALESCE(pending_plan_effective_at, $9),
+             current_period_start = $4,
+             current_period_end = $5,
+             grace_period_end = $6,
+             updated_at = NOW()
+         WHERE owner_id = $1
+         RETURNING *`,
+        [ownerId, resolvedPlanCode, status, nowIso, periodEndIso, graceEndIso, subscriptionId, pendingCode, periodEndIso]
+      );
+    }
+
+    // Best-effort: registrar el pago inicial en el historial si PayPal lo provee.
+    // Nota: los cobros mensuales normalmente se registran vía webhook; en localhost el webhook no llega.
+    try {
+      const insertPaymentIfMissing = async ({ txId, amount, currency, paidAt, meta }) => {
+        if (!txId) return;
+        const exists = await client.query(
+          `SELECT 1 FROM payments WHERE provider = 'paypal_subscription' AND provider_payment_id = $1 LIMIT 1`,
+          [String(txId)]
+        );
+        if (exists.rows.length !== 0) return;
+
+        await client.query(
+          `INSERT INTO payments (
+            owner_id,
+            provider,
+            status,
+            amount,
+            currency,
+            provider_payment_id,
+            metadata,
+            paid_at,
+            created_at,
+            updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
+          [
+            ownerId,
+            'paypal_subscription',
+            'confirmed',
+            amount != null ? Number(amount) : null,
+            currency ? String(currency).toUpperCase() : null,
+            String(txId),
+            meta || { source: 'confirm', subscriptionId },
+            paidAt ? new Date(paidAt).toISOString() : new Date().toISOString(),
+          ]
+        );
+      };
+
+      const lastPayment =
+        ppData?.billing_info?.last_payment ||
+        ppData?.billing_info?.last_payment_details ||
+        ppData?.billing_info?.last_payment_detail ||
+        null;
+
+      const transactionId =
+        lastPayment?.transaction_id ||
+        lastPayment?.id ||
+        lastPayment?.transactionId ||
+        lastPayment?.transactionID ||
+        null;
+
+      if (transactionId) {
+        const amount =
+          lastPayment?.amount?.value ||
+          lastPayment?.amount?.total ||
+          lastPayment?.amount?.amount ||
+          null;
+        const currency =
+          lastPayment?.amount?.currency_code ||
+          lastPayment?.amount?.currency ||
+          lastPayment?.amount?.currencyCode ||
+          null;
+        const paidAt = lastPayment?.time || lastPayment?.create_time || lastPayment?.paid_at || null;
+
+        await insertPaymentIfMissing({
+          txId: transactionId,
+          amount,
+          currency,
+          paidAt,
+          meta: { source: 'confirm', subscriptionId, raw: ppData },
+        });
+      } else {
+        try {
+          const end = new Date();
+          const start = new Date(end.getTime() - 10 * 24 * 60 * 60 * 1000);
+          const qs = new URLSearchParams({
+            start_time: start.toISOString(),
+            end_time: end.toISOString(),
+          });
+
+          const txRes = await fetch(
+            `${baseUrl}/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}/transactions?${qs.toString()}`,
+            {
+              method: 'GET',
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+              },
+            }
+          );
+
+          const txData = await txRes.json().catch(() => null);
+          const txs = Array.isArray(txData?.transactions) ? txData.transactions : [];
+          const pick =
+            txs.find((t) => {
+              const s = String(t?.status || '').toUpperCase();
+              return s === 'COMPLETED' || s === 'SUCCESS';
+            }) || txs[0] || null;
+
+          const txId = pick?.id || pick?.transaction_id || pick?.transactionId || null;
+          const amount =
+            pick?.amount_with_breakdown?.gross_amount?.value ||
+            pick?.amount_with_breakdown?.gross_amount?.amount ||
+            pick?.amount_with_breakdown?.net_amount?.value ||
+            pick?.amount?.value ||
+            pick?.amount?.total ||
+            pick?.amount?.amount ||
+            null;
+          const currency =
+            pick?.amount_with_breakdown?.gross_amount?.currency_code ||
+            pick?.amount_with_breakdown?.gross_amount?.currency ||
+            pick?.amount_with_breakdown?.net_amount?.currency_code ||
+            pick?.amount?.currency_code ||
+            pick?.amount?.currency ||
+            null;
+          const paidAt = pick?.time || pick?.create_time || pick?.paid_at || null;
+
+          await insertPaymentIfMissing({
+            txId,
+            amount,
+            currency,
+            paidAt,
+            meta: { source: 'confirm_transactions', subscriptionId, raw: txData, transaction: pick },
+          });
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      // best-effort
+    }
 
     await client.query('COMMIT');
 
@@ -382,6 +638,26 @@ export const paypalCancelSubscription = async (req, res) => {
 
     if (!ppRes.ok) {
       const ppData = await ppRes.json().catch(() => null);
+      if (String(ppData?.name || '').toUpperCase() === 'RESOURCE_NOT_FOUND') {
+        try {
+          await client.query(
+            `UPDATE subscriptions
+             SET paypal_subscription_id = NULL,
+                 paypal_subscription_status = NULL,
+                 pending_plan_code = NULL,
+                 pending_plan_effective_at = NULL,
+                 updated_at = NOW()
+             WHERE owner_id = $1`,
+            [ownerId]
+          );
+        } catch {
+          // ignore
+        }
+        return res.status(400).json({
+          message:
+            'No se encontró la suscripción en PayPal. Probablemente es un ID viejo (sandbox/live). Intenta suscribirte de nuevo.',
+        });
+      }
       const err = new Error(ppData?.message || 'Error cancelando suscripción PayPal');
       err.status = 502;
       err.details = ppData;
@@ -474,6 +750,26 @@ export const paypalChangeSubscriptionPlan = async (req, res) => {
 
     const ppData = await ppRes.json().catch(() => null);
     if (!ppRes.ok) {
+      if (String(ppData?.name || '').toUpperCase() === 'RESOURCE_NOT_FOUND') {
+        try {
+          await client.query(
+            `UPDATE subscriptions
+             SET paypal_subscription_id = NULL,
+                 paypal_subscription_status = NULL,
+                 pending_plan_code = NULL,
+                 pending_plan_effective_at = NULL,
+                 updated_at = NOW()
+             WHERE owner_id = $1`,
+            [ownerId]
+          );
+        } catch {
+          // ignore
+        }
+        return res.status(400).json({
+          message:
+            'No se encontró la suscripción en PayPal. Probablemente es un ID viejo (sandbox/live). Intenta suscribirte de nuevo.',
+        });
+      }
       const err = new Error(ppData?.message || 'Error cambiando plan de suscripción PayPal');
       err.status = 502;
       err.details = ppData;
@@ -564,6 +860,7 @@ export const paypalWebhook = async (req, res) => {
         !eventType.includes('REFUNDED'));
 
     if (isPaymentSuccessEvent && transactionId) {
+      let planCodeFromPaypal = null;
       // Sync internal plan_code from PayPal subscription (source of truth)
       try {
         const accessToken = await getPaypalAccessToken();
@@ -577,11 +874,13 @@ export const paypalWebhook = async (req, res) => {
         });
         const ppData = await ppRes.json().catch(() => null);
         if (ppRes.ok) {
-          const planCodeFromPaypal = getPlanCodeForPaypalPlanId(ppData?.plan_id);
+          planCodeFromPaypal = getPlanCodeForPaypalPlanId(ppData?.plan_id);
           if (planCodeFromPaypal) {
             await client.query(
               `UPDATE subscriptions
                SET plan_code = COALESCE($2, plan_code),
+                   pending_plan_code = NULL,
+                   pending_plan_effective_at = NULL,
                    updated_at = NOW()
                WHERE owner_id = $1`,
               [ownerId, planCodeFromPaypal]
@@ -598,11 +897,11 @@ export const paypalWebhook = async (req, res) => {
       );
 
       if (exists.rows.length === 0) {
-        const renewed = await renewSubscription30Days(client, ownerId);
-
         const amount = resource?.amount?.total || resource?.amount?.value || resource?.amount?.amount || null;
         const currency = resource?.amount?.currency || resource?.amount?.currency_code || resource?.amount?.currencyCode || null;
         const paidAt = resource?.time || resource?.create_time || null;
+
+        const renewed = await renewSubscriptionMonths(client, ownerId, { months: 1, planCode: planCodeFromPaypal || null });
 
         await client.query(
           `INSERT INTO payments (
@@ -713,6 +1012,37 @@ const renewSubscription30Days = async (client, ownerId) => {
   return updated.rows[0];
 };
 
+const renewSubscriptionMonths = async (client, ownerId, { months, planCode } = {}) => {
+  const sub = await getOrCreateOwnerSubscription(client, ownerId);
+
+  const usage = await computeOwnerUsageCounts(client, ownerId);
+  const pricing = computeMonthlyPriceDop(usage);
+  const resolvedPlanCode = planCode || sub?.pending_plan_code || sub?.plan_code || pricing?.tier?.code || null;
+
+  const m = clampInt(months, { min: 1, max: 36, fallback: 1 });
+
+  const now = new Date();
+  const currentEnd = sub?.current_period_end ? new Date(sub.current_period_end) : null;
+  const start = currentEnd && currentEnd > now ? currentEnd : now;
+  const periodEnd = new Date(start.getTime() + m * 30 * 24 * 60 * 60 * 1000);
+  const graceEnd = new Date(periodEnd.getTime() + 5 * 24 * 60 * 60 * 1000);
+
+  const updated = await client.query(
+    `UPDATE subscriptions
+     SET status = 'active',
+         plan_code = COALESCE($5, plan_code),
+         current_period_start = $2,
+         current_period_end = $3,
+         grace_period_end = $4,
+         updated_at = NOW()
+     WHERE owner_id = $1
+     RETURNING *`,
+    [ownerId, start.toISOString(), periodEnd.toISOString(), graceEnd.toISOString(), resolvedPlanCode]
+  );
+
+  return updated.rows[0];
+};
+
 const getPaypalBaseUrl = () => {
   const mode = String(process.env.PAYPAL_MODE || 'sandbox').trim().toLowerCase();
   return mode === 'live'
@@ -801,10 +1131,21 @@ const computePaypalAmountFromDop = (dopTotal) => {
 export const getPaypalConfig = async (req, res) => {
   try {
     assertPaypalConfigured();
+
+    const planIds = {};
+    try {
+      for (const code of Array.from(VALID_PLAN_CODES || [])) {
+        planIds[code] = getPaypalPlanIdForCode(code) || null;
+      }
+    } catch {
+      // ignore
+    }
+
     return res.json({
       clientId: process.env.PAYPAL_CLIENT_ID,
       mode: String(process.env.PAYPAL_MODE || 'sandbox'),
       currency: getPaypalCurrency(),
+      planIds,
     });
   } catch (error) {
     return res.status(error.status || 500).json({ message: error.message || 'Error del servidor' });
@@ -822,9 +1163,22 @@ export const paypalCreateOrder = async (req, res) => {
       return res.status(403).json({ message: 'Acceso denegado' });
     }
 
+    const { planCode } = req.body || {};
+    const code = String(planCode || '').trim();
+    if (!VALID_PLAN_CODES.has(code)) {
+      return res.status(400).json({ message: 'planCode inválido' });
+    }
+
+    const sub = await getOrCreateOwnerSubscription(client, ownerId);
+    const ppStatus = String(sub?.paypal_subscription_status || '').toUpperCase();
+    if (sub?.paypal_subscription_id && ppStatus && ppStatus !== 'CANCELLED') {
+      return res.status(409).json({
+        message: 'Ya tienes una suscripción PayPal activa. Usa la sección de Suscripción para gestionar tu plan.',
+      });
+    }
+
     const usage = await computeOwnerUsageCounts(client, ownerId);
     const pricing = computeMonthlyPriceDop(usage);
-
     if (pricing?.total == null || !Number.isFinite(Number(pricing.total)) || Number(pricing.total) <= 0) {
       return res.status(400).json({
         message:
@@ -836,8 +1190,20 @@ export const paypalCreateOrder = async (req, res) => {
       });
     }
 
+    const requiredCode = pricing?.tier?.code || 'basic_1';
+    const idx = (c) => PLAN_TIERS.findIndex((t) => t.code === String(c || '').trim());
+    if (idx(code) < idx(requiredCode)) {
+      return res.status(400).json({
+        message: `Tu cuenta requiere al menos el plan ${requiredCode}. Elige un plan igual o superior.`,
+        requiredPlanCode: requiredCode,
+      });
+    }
+
+    const tier = getTierForCode(code);
+    if (!tier) return res.status(400).json({ message: 'planCode inválido' });
+
     const currency = getPaypalCurrency();
-    const amountValue = computePaypalAmountFromDop(pricing.total);
+    const amountValue = computePaypalAmountFromDop(tier.priceDop);
     if (Number(amountValue) <= 0) {
       return res.status(400).json({ message: 'Monto inválido para crear orden' });
     }
@@ -849,12 +1215,12 @@ export const paypalCreateOrder = async (req, res) => {
       intent: 'CAPTURE',
       purchase_units: [
         {
-          reference_id: `owner_${ownerId}`,
+          reference_id: `owner_${ownerId}_plan_${code}`,
           amount: {
             currency_code: currency,
             value: amountValue,
           },
-          description: 'Suscripción Stylex (30 días)'
+          description: `Stylex (30 días) - Plan ${code}`
         },
       ],
     };
@@ -876,7 +1242,7 @@ export const paypalCreateOrder = async (req, res) => {
       throw err;
     }
 
-    return res.json({ id: ppData?.id, raw: ppData });
+    return res.json({ id: ppData?.id, planCode: code, raw: ppData });
   } catch (error) {
     console.error('Error paypalCreateOrder:', error);
     return res.status(error.status || 500).json({ message: error.message || 'Error del servidor' });
@@ -896,8 +1262,21 @@ export const paypalCaptureOrder = async (req, res) => {
       return res.status(403).json({ message: 'Acceso denegado' });
     }
 
-    const { orderId } = req.body || {};
+    const { orderId, planCode } = req.body || {};
     if (!orderId) return res.status(400).json({ message: 'orderId requerido' });
+
+    const code = String(planCode || '').trim();
+    if (!VALID_PLAN_CODES.has(code)) {
+      return res.status(400).json({ message: 'planCode inválido' });
+    }
+
+    const sub = await getOrCreateOwnerSubscription(client, ownerId);
+    const ppStatus = String(sub?.paypal_subscription_status || '').toUpperCase();
+    if (sub?.paypal_subscription_id && ppStatus && ppStatus !== 'CANCELLED') {
+      return res.status(409).json({
+        message: 'Ya tienes una suscripción PayPal activa. Usa la sección de Suscripción para gestionar tu plan.',
+      });
+    }
 
     const accessToken = await getPaypalAccessToken();
     const baseUrl = getPaypalBaseUrl();
@@ -929,9 +1308,33 @@ export const paypalCaptureOrder = async (req, res) => {
     const currency = capture?.amount?.currency_code || String(process.env.PAYPAL_CURRENCY || 'DOP').toUpperCase();
     const paidAt = capture?.create_time || null;
 
+    const tier = getTierForCode(code);
+    if (!tier) return res.status(400).json({ message: 'planCode inválido' });
+    const expected = computePaypalAmountFromDop(tier.priceDop);
+    if (!expected) return res.status(500).json({ message: 'No se pudo calcular monto esperado' });
+    const paid = amount != null ? Number(amount) : null;
+    const exp = Number(expected);
+    if (!Number.isFinite(paid) || !Number.isFinite(exp) || Math.abs(paid - exp) > 0.011) {
+      return res.status(400).json({
+        message: 'El monto pagado no coincide con el plan seleccionado. Intenta de nuevo.',
+        expectedAmount: expected,
+        paidAmount: amount,
+        currency,
+      });
+    }
+
     await client.query('BEGIN');
 
-    const renewed = await renewSubscription30Days(client, ownerId);
+    const renewed = await renewSubscriptionMonths(client, ownerId, { months: 1, planCode: code });
+
+    await client.query(
+      `UPDATE subscriptions
+       SET pending_plan_code = NULL,
+           pending_plan_effective_at = NULL,
+           updated_at = NOW()
+       WHERE owner_id = $1`,
+      [ownerId]
+    );
 
     await client.query(
       `INSERT INTO payments (
@@ -953,7 +1356,7 @@ export const paypalCaptureOrder = async (req, res) => {
         amount != null ? Number(amount) : null,
         currency,
         captureId || orderId,
-        { orderId, captureId, raw: ppData },
+        { orderId, captureId, planCode: code, raw: ppData },
         paidAt ? new Date(paidAt).toISOString() : new Date().toISOString(),
       ]
     );
@@ -1158,9 +1561,47 @@ export const createManualPaymentReport = async (req, res) => {
       [finalOwnerId]
     );
 
+    const reportRow = insert.rows[0];
+    const adminMessage = 'Hay un reporte de pago manual pendiente de revisión.';
+    await client.query(
+      `INSERT INTO notifications (
+        user_id,
+        type,
+        title,
+        message,
+        status,
+        payload,
+        created_at,
+        updated_at
+      )
+      SELECT u.id, $1, $2, $3, 'PENDING', $4::jsonb, NOW(), NOW()
+      FROM users u
+      WHERE LOWER(COALESCE(u.role, '')) LIKE '%admin%'`,
+      [
+        'ADMIN_MANUAL_PAYMENT_PENDING',
+        'Reporte de pago pendiente',
+        adminMessage,
+        JSON.stringify({ reportId: reportRow.id, ownerId: finalOwnerId }),
+      ]
+    );
+
     await client.query('COMMIT');
 
-    return res.status(201).json(insert.rows[0]);
+    try {
+      await sendPushToAdmins({
+        title: 'StyleX',
+        body: adminMessage,
+        data: {
+          type: 'ADMIN_MANUAL_PAYMENT_PENDING',
+          reportId: String(reportRow.id),
+          ownerId: String(finalOwnerId),
+        },
+      });
+    } catch {
+      // ignore
+    }
+
+    return res.status(201).json(reportRow);
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error createManualPaymentReport:', error);
@@ -1231,7 +1672,25 @@ export const approveManualPaymentReport = async (req, res) => {
     }
 
     const ownerId = report.owner_id;
-    const renewed = await renewSubscription30Days(client, ownerId);
+
+    const { planCode: rawPlanCode, months: rawMonths } = req.body || {};
+    const planCode = String(rawPlanCode || '').trim();
+    const hasPlanCode = Boolean(planCode);
+    const hasMonths = rawMonths != null && String(rawMonths).trim() !== '';
+
+    let renewed;
+    if (!hasPlanCode && !hasMonths) {
+      renewed = await renewSubscription30Days(client, ownerId);
+    } else {
+      if (hasPlanCode && !VALID_PLAN_CODES.has(planCode)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'planCode inválido' });
+      }
+      renewed = await renewSubscriptionMonths(client, ownerId, {
+        planCode: hasPlanCode ? planCode : undefined,
+        months: rawMonths,
+      });
+    }
 
     await client.query(
       `INSERT INTO payments (
@@ -1257,6 +1716,8 @@ export const approveManualPaymentReport = async (req, res) => {
           reportId: report.id,
           referenceText: report.reference_text,
           proofUrl: report.proof_url,
+          planCode: hasPlanCode ? planCode : null,
+          months: hasMonths ? rawMonths : null,
           approvedBy: requesterId,
         },
       ]

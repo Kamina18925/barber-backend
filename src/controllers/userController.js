@@ -38,6 +38,38 @@ const getAdminFromOptionalJwt = (req) => {
   }
 };
 
+export const getPublicBarbersByShop = async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const parsedShopId = Number(shopId);
+    if (!Number.isFinite(parsedShopId)) {
+      return res.status(400).json({ message: 'shopId inválido' });
+    }
+
+    const result = await pool.query(
+      `SELECT id, name, email, phone, role, shop_id, photo_url, whatsapp_link, gender
+       FROM users
+       WHERE deleted_at IS NULL
+         AND LOWER(role) LIKE '%barber%'
+         AND shop_id = $1
+       ORDER BY name`,
+      [parsedShopId]
+    );
+
+    const rows = (result.rows || []).map((u) => ({
+      ...u,
+      shopId: u.shop_id,
+      photoUrl: u.photo_url,
+      whatsappLink: u.whatsapp_link,
+    }));
+
+    return res.json(rows);
+  } catch (error) {
+    console.error('Error getPublicBarbersByShop:', error);
+    return res.status(500).json({ message: 'Error del servidor al obtener profesionales' });
+  }
+};
+
 export const getVisibleUsers = async (req, res) => {
   try {
     const requesterId = req.user?.userId;
@@ -568,11 +600,14 @@ export const createUser = async (req, res) => {
     const requesterJwt = getAdminFromOptionalJwt(req);
     const requesterRole = normalizeRole(requesterJwt?.role);
 
+    const allowedPublicRoles = new Set(['client', 'owner']);
     const allowedCreateRoles = new Set(['client', 'barber']);
     const safeDesiredRole = allowedCreateRoles.has(desiredRole) ? desiredRole : 'client';
 
     let finalRole = 'client';
-    if (requesterRole.includes('admin')) {
+    if (!requesterJwt) {
+      finalRole = allowedPublicRoles.has(desiredRole) ? desiredRole : 'client';
+    } else if (requesterRole.includes('admin')) {
       finalRole = safeDesiredRole;
     } else if (requesterRole.includes('owner')) {
       finalRole = safeDesiredRole === 'barber' ? 'barber' : 'client';
@@ -593,6 +628,10 @@ export const createUser = async (req, res) => {
       }
       finalShopId = parsed;
     } else {
+      finalShopId = null;
+    }
+
+    if (!requesterJwt) {
       finalShopId = null;
     }
 
@@ -739,7 +778,7 @@ export const updateUser = async (req, res) => {
 
     if (!requesterIsAdmin && !requesterIsOwner) {
       await client.query('ROLLBACK');
-      return res.status(403).json({ message: 'Acceso denegado' });
+      return res.status(403).json({ message: 'Acceso denegado: se requiere rol owner o admin.' });
     }
 
     if (requesterIsOwner && !requesterIsAdmin) {
@@ -749,7 +788,7 @@ export const updateUser = async (req, res) => {
 
       if (!isSelf && !targetIsBarber) {
         await client.query('ROLLBACK');
-        return res.status(403).json({ message: 'Acceso denegado' });
+        return res.status(403).json({ message: 'Acceso denegado: solo puedes gestionar profesionales (barberos).' });
       }
 
       const ownerShopsRes = await client.query(
@@ -794,13 +833,13 @@ export const updateUser = async (req, res) => {
       if (isSelf) {
         if (newShopId != null && !ownsShop(newShopId)) {
           await client.query('ROLLBACK');
-          return res.status(403).json({ message: 'Acceso denegado' });
+          return res.status(403).json({ message: 'Acceso denegado: no puedes asignarte a un negocio que no es tuyo.' });
         }
         if (role !== undefined) {
           const nextRole = normalizeRole(role);
           if (nextRole.includes('admin')) {
             await client.query('ROLLBACK');
-            return res.status(403).json({ message: 'Acceso denegado' });
+            return res.status(403).json({ message: 'Acceso denegado: no puedes asignarte rol admin.' });
           }
         }
       } else {
@@ -809,23 +848,23 @@ export const updateUser = async (req, res) => {
           if (newShopId == null) {
             if (oldShopId != null && !ownsShop(oldShopId)) {
               await client.query('ROLLBACK');
-              return res.status(403).json({ message: 'Acceso denegado' });
+              return res.status(403).json({ message: 'Acceso denegado: no puedes desasignar profesionales de negocios que no son tuyos.' });
             }
           } else if (!ownsShop(newShopId)) {
             await client.query('ROLLBACK');
-            return res.status(403).json({ message: 'Acceso denegado' });
+            return res.status(403).json({ message: 'Acceso denegado: solo puedes asignar profesionales a tus propios negocios.' });
           }
         } else {
           // Si no se cambia shop, igual exigir que el barbero pertenezca a un negocio del owner o esté sin asignar
           if (oldShopId != null && !ownsShop(oldShopId)) {
             await client.query('ROLLBACK');
-            return res.status(403).json({ message: 'Acceso denegado' });
+            return res.status(403).json({ message: 'Acceso denegado: no puedes modificar profesionales de otros negocios.' });
           }
         }
 
         if (role !== undefined) {
           await client.query('ROLLBACK');
-          return res.status(403).json({ message: 'Acceso denegado' });
+          return res.status(403).json({ message: 'Acceso denegado: no puedes cambiar el rol de otros usuarios.' });
         }
       }
     }
