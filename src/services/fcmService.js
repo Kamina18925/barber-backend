@@ -96,13 +96,61 @@ export const sendPushToTokens = async (tokens, { title, body, data } = {}) => {
 
   try {
     const res = await admin.messaging().sendEachForMulticast(message);
+    let errorCodes = null;
+    let removedInvalidTokens = 0;
+    try {
+      const responses = Array.isArray(res.responses) ? res.responses : [];
+      const tokensToRemove = [];
+
+      for (let i = 0; i < responses.length; i += 1) {
+        const r = responses[i];
+        if (!r || r.success) continue;
+        const code = String(r?.error?.code || '');
+        if (
+          code === 'messaging/registration-token-not-registered' ||
+          code === 'messaging/invalid-registration-token'
+        ) {
+          const t = list[i];
+          if (t) tokensToRemove.push(t);
+        }
+      }
+
+      if (tokensToRemove.length) {
+        await pool.query(
+          `DELETE FROM fcm_tokens
+           WHERE token = ANY($1::text[])`,
+          [tokensToRemove]
+        );
+        removedInvalidTokens = tokensToRemove.length;
+      }
+    } catch {
+    }
     try {
       const successCount = Number(res.successCount || 0) || 0;
       const failureCount = Number(res.failureCount || 0) || 0;
-      console.log(`FCM multicast: sent=${successCount} failures=${failureCount}`);
+      errorCodes = {};
+      const responses = Array.isArray(res.responses) ? res.responses : [];
+      responses.forEach((r) => {
+        if (r?.success) return;
+        const code = String(r?.error?.code || 'unknown');
+        errorCodes[code] = (errorCodes[code] || 0) + 1;
+      });
+      const codesSummary = Object.keys(errorCodes).length
+        ? JSON.stringify(errorCodes)
+        : '';
+      console.log(
+        `FCM multicast: tokens=${list.length} sent=${successCount} failures=${failureCount}${codesSummary ? ` codes=${codesSummary}` : ''}`
+      );
     } catch {
     }
-    return { enabled: true, sent: res.successCount || 0, failures: res.failureCount || 0 };
+    return {
+      enabled: true,
+      sent: res.successCount || 0,
+      failures: res.failureCount || 0,
+      tokensCount: list.length,
+      removedInvalidTokens,
+      ...(errorCodes ? { errorCodes } : {}),
+    };
   } catch (e) {
     console.warn('FCM send error:', e?.message || e);
     return { enabled: true, sent: 0, error: e?.message || String(e) };
