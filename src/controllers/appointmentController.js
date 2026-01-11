@@ -1,6 +1,7 @@
 import pool from '../db/connection.js';
 import { getOrCreateClientBarberConversation } from './chatController.js';
 import { enforceShopSubscriptionForBooking } from '../services/subscriptionService.js';
+import { sendPushToUser } from '../services/fcmService.js';
 
 const normalizeRole = (role) => String(role || '').toLowerCase();
 
@@ -969,6 +970,22 @@ export const proposeAdvanceAppointment = async (req, res) => {
     const notification = notifRes.rows[0];
     
     await client.query('COMMIT');
+
+    // Enviar push real (FCM) para que llegue incluso con la app cerrada.
+    // Si FCM no está configurado en el servidor, sendPushToUser simplemente no enviará.
+    try {
+      await sendPushToUser(appointment.client_id, {
+        title: 'StyleX',
+        body: `Tu barbero sugiere adelantar la cita a las ${timeLabel}`,
+        data: {
+          type: 'RESCHEDULE_PROPOSAL',
+          notificationId: String(notification.id),
+          appointmentId: String(appointment.id),
+        },
+      });
+    } catch (e) {
+      console.warn('No se pudo enviar push RESCHEDULE_PROPOSAL:', e?.message || e);
+    }
     
     // Crear/obtener conversación y mensaje de sistema en una transacción aparte
     let conversationId;

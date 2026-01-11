@@ -3,6 +3,7 @@ import pool from '../db/connection.js';
 
 let initialized = false;
 let initAttempted = false;
+let initLogged = false;
 
 const parseServiceAccount = () => {
   const base64 = String(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 || '').trim();
@@ -31,6 +32,10 @@ const ensureInitialized = () => {
         credential: admin.credential.cert(sa),
       });
       initialized = true;
+      if (!initLogged) {
+        initLogged = true;
+        console.log('FCM initialized (service account).');
+      }
       return true;
     }
 
@@ -39,6 +44,10 @@ const ensureInitialized = () => {
         credential: admin.credential.applicationDefault(),
       });
       initialized = true;
+      if (!initLogged) {
+        initLogged = true;
+        console.log('FCM initialized (application default credentials).');
+      }
       return true;
     }
 
@@ -87,6 +96,12 @@ export const sendPushToTokens = async (tokens, { title, body, data } = {}) => {
 
   try {
     const res = await admin.messaging().sendEachForMulticast(message);
+    try {
+      const successCount = Number(res.successCount || 0) || 0;
+      const failureCount = Number(res.failureCount || 0) || 0;
+      console.log(`FCM multicast: sent=${successCount} failures=${failureCount}`);
+    } catch {
+    }
     return { enabled: true, sent: res.successCount || 0, failures: res.failureCount || 0 };
   } catch (e) {
     console.warn('FCM send error:', e?.message || e);

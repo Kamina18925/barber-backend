@@ -37,6 +37,13 @@ export const registerFcmToken = async (req, res) => {
     );
 
     await client.query('COMMIT');
+    try {
+      const prefix = finalToken ? `${finalToken.slice(0, 12)}...` : '';
+      console.log(
+        `FCM token registered: userId=${String(userId)} platform=${String(finalPlatform || '')} deviceId=${String(finalDeviceId || '')} token=${prefix}`
+      );
+    } catch {
+    }
     return res.json({ success: true });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -73,6 +80,11 @@ export const unregisterFcmToken = async (req, res) => {
     }
 
     await client.query('COMMIT');
+    try {
+      const prefix = finalToken ? `${finalToken.slice(0, 12)}...` : '';
+      console.log(`FCM token unregistered: userId=${String(userId)} token=${prefix}`);
+    } catch {
+    }
     return res.json({ success: true });
   } catch (error) {
     await client.query('ROLLBACK');

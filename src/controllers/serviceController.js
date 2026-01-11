@@ -104,14 +104,17 @@ export const createService = async (req, res) => {
       duration,
       duracion,
       shopId,
-      shop_id
+      shop_id,
+      barberId,
+      barber_id
     } = body;
 
     const finalName = name || nombre;
     const finalDescription = description || descripcion || null;
     const finalPrice = price !== undefined ? Number(price) : (precio !== undefined ? Number(precio) : null);
     const finalDuration = duration !== undefined ? Number(duration) : (duracion !== undefined ? Number(duracion) : null);
-    const finalShopId = shopId !== undefined ? shopId : (shop_id !== undefined ? shop_id : null);
+    let finalShopId = shopId !== undefined ? shopId : (shop_id !== undefined ? shop_id : null);
+    const finalBarberId = barberId !== undefined ? barberId : (barber_id !== undefined ? barber_id : null);
 
     if (!finalName || finalName.trim() === '') {
       await client.query('ROLLBACK');
@@ -126,6 +129,34 @@ export const createService = async (req, res) => {
     if (finalDuration === null || Number.isNaN(finalDuration) || finalDuration <= 0) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'La duración del servicio es obligatoria y debe ser numérica positiva' });
+    }
+
+    if (finalBarberId != null) {
+      const barberIdNum = Number(finalBarberId);
+      if (!Number.isFinite(barberIdNum)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'barberId inválido' });
+      }
+
+      const barberRes = await client.query(
+        'SELECT id, shop_id FROM users WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+        [barberIdNum]
+      );
+
+      if (barberRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ message: 'Barbero no encontrado' });
+      }
+
+      const barberShopId = barberRes.rows[0]?.shop_id ?? null;
+      if (finalShopId == null && barberShopId != null) {
+        finalShopId = barberShopId;
+      }
+
+      if (finalShopId != null && barberShopId != null && String(finalShopId) !== String(barberShopId)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'barberId no pertenece a esa barbería (shopId)' });
+      }
     }
 
     if (finalShopId != null) {
@@ -158,6 +189,13 @@ export const createService = async (req, res) => {
         finalShopId
       ]
     );
+
+    if (finalBarberId != null) {
+      await client.query(
+        'INSERT INTO barber_services (barber_id, service_id) VALUES ($1, $2) ON CONFLICT (barber_id, service_id) DO NOTHING',
+        [finalBarberId, result.rows[0].id]
+      );
+    }
 
     await client.query('COMMIT');
 

@@ -1588,7 +1588,7 @@ export const createManualPaymentReport = async (req, res) => {
     await client.query('COMMIT');
 
     try {
-      await sendPushToAdmins({
+      const pushRes = await sendPushToAdmins({
         title: 'StyleX',
         body: adminMessage,
         data: {
@@ -1597,6 +1597,10 @@ export const createManualPaymentReport = async (req, res) => {
           ownerId: String(finalOwnerId),
         },
       });
+      try {
+        console.log('FCM admin manual payment push result:', pushRes);
+      } catch {
+      }
     } catch {
       // ignore
     }
